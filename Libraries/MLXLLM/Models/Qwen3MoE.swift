@@ -187,6 +187,8 @@ class Qwen3MoeDecoderLayer: Module {
     }
 }
 
+extension Qwen3MoeDecoderLayer: DistributedLayerProtocol3 {}
+
 public class Qwen3MoEModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 

@@ -390,7 +390,7 @@ final class Qwen3NextDecoderLayer: Module {
         super.init()
     }
 
-    func callAsFunction(
+    public func callAsFunction(
         _ x: MLXArray,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,

@@ -475,7 +475,7 @@ final class Qwen35DecoderLayer: Module {
         super.init()
     }
 
-    func callAsFunction(
+    public func callAsFunction(
         _ x: MLXArray,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
@@ -492,6 +492,8 @@ final class Qwen35DecoderLayer: Module {
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
 }
+
+extension Qwen35DecoderLayer: DistributedLayerProtocol4 {}
 
 // MARK: - Text Model
 
