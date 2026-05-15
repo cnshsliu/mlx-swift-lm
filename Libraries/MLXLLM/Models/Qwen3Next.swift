@@ -411,6 +411,8 @@ final class Qwen3NextDecoderLayer: Module {
     }
 }
 
+extension Qwen3NextDecoderLayer: DistributedLayerProtocol4 {}
+
 public class Qwen3NextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 

@@ -332,6 +332,8 @@ class GPTOSSTransformerBlock: Module {
     }
 }
 
+extension GPTOSSTransformerBlock: DistributedLayerProtocol3 {}
+
 public class GPTOSSModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo(key: "norm") var norm: RMSNorm

@@ -4,27 +4,24 @@ import Foundation
 import MLX
 import MLXNN
 
-/// Load model weights.
+/// Load raw weight arrays from a model directory.
 ///
-/// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
-/// This function loads all `safetensor` files in the given `modelDirectory`,
-/// calls ``BaseLanguageModel/sanitize(weights:metadata:)`` to allow per-model preprocessing,
-/// applies optional quantization, and
-/// updates the model with the weights.
-public func loadWeights(
-    modelDirectory: URL, model: BaseLanguageModel,
-    quantization: BaseConfiguration.Quantization? = nil,
-    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
-) throws {
-    // load the weights and collect metadata from the first safetensor file
+/// Supports both `.safetensors` and `.gguf` file formats.
+/// If GGUF files are present, they take precedence over safetensors.
+private func loadRawWeights(modelDirectory: URL) throws -> (
+    weights: [String: MLXArray], metadata: [String: String]
+) {
+    if hasGGUFWeights(in: modelDirectory) {
+        let weights = try loadGGUFWeights(modelDirectory: modelDirectory)
+        return (weights, [:])
+    }
+
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
     let enumerator = FileManager.default.enumerator(
         at: modelDirectory, includingPropertiesForKeys: nil)!
-    var safetensorCount = 0
     for case let url as URL in enumerator {
         if url.pathExtension == "safetensors" {
-            safetensorCount += 1
             let (w, m) = try loadArraysAndMetadata(url: url)
             for (key, value) in w {
                 weights[key] = value
@@ -34,6 +31,24 @@ public func loadWeights(
             }
         }
     }
+    return (weights, metadata)
+}
+
+/// Load model weights.
+///
+/// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
+/// This function loads all `safetensor` files in the given `modelDirectory`,
+/// calls ``BaseLanguageModel/sanitize(weights:metadata:)`` to allow per-model preprocessing,
+/// applies optional quantization, and
+/// updates the model with the weights.
+///
+/// Also supports loading weights from `.gguf` files if present.
+public func loadWeights(
+    modelDirectory: URL, model: BaseLanguageModel,
+    quantization: BaseConfiguration.Quantization? = nil,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
+) throws {
+    var (weights, metadata) = try loadRawWeights(modelDirectory: modelDirectory)
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)

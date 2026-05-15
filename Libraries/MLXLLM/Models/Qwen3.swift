@@ -139,6 +139,8 @@ class Qwen3TransformerBlock: Module {
     }
 }
 
+extension Qwen3TransformerBlock: DistributedLayerProtocol3 {}
+
 public class Qwen3ModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
