@@ -13,7 +13,7 @@ import MLXNN
 
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
     let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-    return decay.asType(a.dtype)
+    return decay
 }
 
 // MARK: - Metal Kernel
@@ -56,10 +56,20 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
             for (int t = 0; t < T; ++t) {
               if (\(maskSource)) {
                 float kv_mem = 0.0f;
-                for (int i = 0; i < n_per_t; ++i) {
-                  auto s_idx = n_per_t * dk_idx + i;
-                  state[i] = state[i] * g_[hv_idx];
-                  kv_mem += state[i] * k_[s_idx];
+                {
+                  // Preserve Kahan summation under Metal's default fast math.
+                  #pragma clang fp reassociate(off)
+                  #pragma clang fp contract(off)
+                  float kv_compensation = 0.0f;
+                  for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] * g_[hv_idx];
+                    auto product = state[i] * k_[s_idx];
+                    auto corrected = product - kv_compensation;
+                    auto next_sum = kv_mem + corrected;
+                    kv_compensation = (next_sum - kv_mem) - corrected;
+                    kv_mem = next_sum;
+                  }
                 }
                 kv_mem = simd_sum(kv_mem);
 
@@ -75,6 +85,8 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
                 if (thread_index_in_simdgroup == 0) {
                   y[dv_idx] = static_cast<InT>(out);
                 }
+              } else {
+                y[dv_idx] = static_cast<InT>(0);
               }
               // Increment data pointers to next time step
               q_ += Hk * Dk;
@@ -210,7 +222,7 @@ private func gatedDeltaStepOps(
         state = MLX.where(expandedMask, state, oldState)
     }
 
-    return (y, state)
+    return (y.asType(q.dtype), state)
 }
 
 func gatedDeltaOps(
@@ -238,7 +250,7 @@ func gatedDeltaOps(
         k = repeated(k, count: repeatFactor, axis: -2)
     }
 
-    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
 
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
@@ -270,7 +282,7 @@ func gatedDeltaOps(
 
 // MARK: - Public API
 
-func gatedDeltaUpdate(
+public func gatedDeltaUpdate(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
@@ -281,7 +293,7 @@ func gatedDeltaUpdate(
     state: MLXArray? = nil,
     mask: MLXArray? = nil
 ) -> (MLXArray, MLXArray) {
-    let beta = sigmoid(b)
+    let beta = sigmoid(b).asType(.float32)
     let g = computeGatedDeltaG(aLog, a, dtBias)
 
     let B = q.dim(0)
@@ -296,7 +308,14 @@ func gatedDeltaUpdate(
         state = state.asType(.float32)
     }
 
-    if GatedDeltaKernelManager.shared.kernel != nil {
+    // The fused kernel distributes Dk over exactly 32 simd lanes
+    // (`n_per_t = Dk / 32`, integer-truncating). A key head dim that is not a
+    // multiple of 32 would silently drop its trailing `Dk % 32` state
+    // dimensions and produce wrong output with no error. Stock Qwen3.5 uses
+    // Dk = 192 (a multiple of 32), but the value is config-driven, so route any
+    // non-multiple-of-32 Dk to the ops fallback, which handles an arbitrary key
+    // dimension correctly (slower, but never truncating).
+    if GatedDeltaKernelManager.shared.kernel != nil, Dk % 32 == 0 {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
 
