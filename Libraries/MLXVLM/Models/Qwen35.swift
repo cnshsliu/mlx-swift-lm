@@ -1081,7 +1081,7 @@ private func qwen35VLMSharedKVOffsets(
 
 // MARK: - Model
 
-public class Qwen35: Module, VLMModel {
+public class Qwen35: Module, VLMModel, MtpTarget {
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") var languageModel: Qwen35Language.LanguageModel
 
@@ -1400,6 +1400,30 @@ public class Qwen35: Module, VLMModel {
             videoGridTHW: nil
         )
         return result
+    }
+
+    public func mtpEmbed(_ tokens: MLXArray) -> MLXArray {
+        languageModel.model.embedTokens(tokens)
+    }
+
+    public func mtpLmHead(_ hidden: MLXArray) -> MLXArray {
+        if let head = languageModel.lmHead {
+            return head(hidden)
+        }
+        return languageModel.model.embedTokens.asLinear(hidden)
+    }
+
+    public func mtpHiddenAndLogits(_ tokens: MLXArray, cache: [KVCache]?) -> (
+        hidden: MLXArray, logits: MLXArray
+    ) {
+        let typedCache = castCacheOptional(cache)
+        let hidden = languageModel.model(
+            tokens,
+            inputsEmbeds: nil,
+            cache: typedCache,
+            positionIds: nil
+        )
+        return (hidden, mtpLmHead(hidden))
     }
 
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:

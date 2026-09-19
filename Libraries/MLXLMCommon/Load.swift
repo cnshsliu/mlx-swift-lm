@@ -378,18 +378,41 @@ public func loadWeights(
     let weightURLs = try safetensorWeightURLs(
         in: modelDirectory,
         selection: weightFileSelection,
-        additionalFiles: additionalFiles ?? [])
-    (weights, metadata) = try loadWeightArrays(urls: weightURLs)
+        additionalFiles: additionalFiles ?? []
+    ).filter { !$0.path.contains("/tie-shards/") }
+
+    if weightURLs.isEmpty, hasGGUFWeights(in: modelDirectory) {
+        weights = try loadGGUFWeights(modelDirectory: modelDirectory)
+    } else {
+        (weights, metadata) = try loadWeightArrays(urls: weightURLs)
+    }
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
 
+    // NovaMLX-TIE: when manifest exists, per-shard scales are in tie-shards/
+    // (not in the in-memory weights dict). The standard quantize() check
+    // (`if weights["\(path).scales"] != nil`) returns false for all layer
+    // Linears → they stay as base Linear → uint32 weight assignment crashes
+    // matmul. Force quantization for any Linear when manifest exists.
+    let manifestExists = FileManager.default.fileExists(
+        atPath: modelDirectory.appendingPathComponent("tier-manifest.json").path)
+
     // quantize if needed
-    if quantization != nil || perLayerQuantization != nil {
+    if quantization != nil || perLayerQuantization != nil || manifestExists {
         quantize(model: model) { path, module in
             if weights["\(path).scales"] != nil {
                 if let perLayerQuantization {
                     return perLayerQuantization.quantization(layer: path)?.asTuple
+                } else {
+                    return quantization?.asTuple
+                }
+            } else if manifestExists
+                && (module is Linear || module is Embedding || module is SwitchLinear)
+            {
+                if let perLayerQuantization {
+                    return perLayerQuantization.quantization(layer: path)?.asTuple
+                        ?? quantization?.asTuple
                 } else {
                     return quantization?.asTuple
                 }
@@ -401,9 +424,12 @@ public func loadWeights(
 
     // apply the loaded weights
     let parameters = ModuleParameters.unflattened(weights)
-    try model.update(parameters: parameters, verify: [.all])
-
-    // Build derived inference-only state and realize the model while the loader
-    // still has exclusive access. Forward passes must remain read-only.
-    materializeModelForInference(model)
+    if manifestExists {
+        // TIE: skip verify (per-shard weights are missing on purpose) and do
+        // not materialize random quantized init into unified memory.
+        model.update(parameters: parameters)
+    } else {
+        try model.update(parameters: parameters, verify: [.all])
+        materializeModelForInference(model)
+    }
 }

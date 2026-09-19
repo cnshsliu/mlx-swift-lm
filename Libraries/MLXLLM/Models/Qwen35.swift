@@ -326,6 +326,24 @@ final class Qwen35GatedDeltaNet: Module {
         )
     }
 
+    /// Inputs captured during a speculative verify so GDN state can be rebuilt
+    /// at an arbitrary accept length (mlx-dspark capture-and-rerun).
+    struct SpecCapture {
+        var q: MLXArray
+        var k: MLXArray
+        var v: MLXArray
+        var a: MLXArray
+        var b: MLXArray
+        var recState: MLXArray?
+        var mask: MLXArray?
+        var convInput: MLXArray
+        var aLog: MLXArray
+        var dtBias: MLXArray
+    }
+
+    var lastSpecCapture: SpecCapture?
+    var isRecordingSpec = false
+
     func callAsFunction(
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
@@ -457,6 +475,13 @@ final class Qwen35GatedDeltaNet: Module {
                 state: recState,
                 mask: mask)
             checkpoint = nil
+            if isRecordingSpec {
+                lastSpecCapture = SpecCapture(
+                    q: qNormed, k: kNormed, v: v, a: a, b: b,
+                    recState: recState, mask: mask,
+                    convInput: concatenated([convState, qkv], axis: 1),
+                    aLog: aLog, dtBias: dtBias)
+            }
         }
 
         let gated = norm(out, gate: z)
@@ -873,8 +898,6 @@ final class Qwen35DecoderLayer: Module {
     }
 }
 
-extension Qwen35DecoderLayer: DistributedLayerProtocol4 {}
-
 // MARK: - Text Model
 
 public class Qwen35TextModelInner: Module {
@@ -911,6 +934,9 @@ public class Qwen35TextModelInner: Module {
 
         super.init()
     }
+
+    /// Number of scheduled single-token compiled segments (traced lazily on first decode).
+    var compiledDecodeSegmentCount: Int { decodeSegments.count }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
         forward(inputs, cache: cache, applyFinalNorm: true)
@@ -954,6 +980,84 @@ public class Qwen35TextModelInner: Module {
         }
 
         return applyFinalNorm ? norm(hiddenStates) : hiddenStates
+    }
+
+    func forwardTapped(
+        _ inputs: MLXArray,
+        cache: [KVCache?]?,
+        tapLayerIds: Set<Int>,
+        recordSpec: Bool
+    ) -> (normed: MLXArray, fused: MLXArray) {
+        if recordSpec {
+            for layer in layers {
+                layer.linearAttn?.isRecordingSpec = true
+                layer.linearAttn?.lastSpecCapture = nil
+            }
+        }
+        defer {
+            if recordSpec {
+                for layer in layers { layer.linearAttn?.isRecordingSpec = false }
+            }
+        }
+
+        var hiddenStates = embedTokens(inputs)
+        var cacheArray = cache
+        if cacheArray == nil {
+            cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
+        }
+        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
+        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        var captured: [MLXArray] = []
+        for (i, layer) in layers.enumerated() {
+            let mask = layer.isLinear ? ssmMask : nil
+            let attnMask =
+                layer.isLinear
+                ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+            hiddenStates = layer(
+                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i],
+                checkpointAfter: nil)
+            if tapLayerIds.contains(i) {
+                captured.append(hiddenStates)
+            }
+        }
+        let fused: MLXArray
+        if captured.isEmpty {
+            fused = hiddenStates
+        } else if captured.count == 1 {
+            fused = captured[0]
+        } else {
+            fused = concatenated(captured, axis: -1)
+        }
+        return (norm(hiddenStates), fused)
+    }
+
+    func rollbackDFlash(cache: [KVCache], nRejected: Int, specWidth: Int) {
+        guard nRejected > 0 else { return }
+        for (layer, c) in zip(layers, cache) {
+            if layer.isLinear, let mamba = c as? MambaCache, let cap = layer.linearAttn?.lastSpecCapture
+            {
+                let capturedWidth = cap.q.dim(1)
+                let keep = min(max(1, specWidth - nRejected), capturedWidth)
+                let window = cap.convInput.dim(1) - capturedWidth
+                guard window >= 0, keep + window <= cap.convInput.dim(1) else { continue }
+                let prefixMask = cap.mask.map { $0[0..., ..<keep] }
+                let (_, newState) = gatedDeltaUpdate(
+                    q: cap.q[0..., ..<keep, 0..., 0...],
+                    k: cap.k[0..., ..<keep, 0..., 0...],
+                    v: cap.v[0..., ..<keep, 0..., 0...],
+                    a: cap.a[0..., ..<keep, 0...],
+                    b: cap.b[0..., ..<keep, 0...],
+                    aLog: cap.aLog,
+                    dtBias: cap.dtBias,
+                    state: cap.recState,
+                    mask: prefixMask)
+                mamba[0] = contiguous(cap.convInput[0..., keep ..< (keep + window), 0...])
+                mamba[1] = newState
+            } else if c.isTrimmable {
+                _ = c.trim(nRejected)
+            }
+        }
+        for layer in layers { layer.linearAttn?.lastSpecCapture = nil }
     }
 
     // MARK: - Whole-step decode schedule
@@ -1070,7 +1174,7 @@ public class Qwen35TextModelInner: Module {
     }
 }
 
-public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, CompiledDecodeReporting {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -1088,6 +1192,12 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
+    }
+
+    public var compiledDecodeSegmentCount: Int { model.compiledDecodeSegmentCount }
+
+    fileprivate static func mtpTokenBatch(_ tokens: MLXArray) -> MLXArray {
+        tokens.ndim == 1 ? tokens.reshaped(1, -1) : tokens
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -1226,9 +1336,55 @@ extension Qwen35TextModel: SpeculativeCacheRewindModel {
     public var maximumNativeTargetCacheRewind: Int { 1 }
 }
 
+extension Qwen35TextModel: DFlashTarget {
+    public var dflashEmbedding: Embedding { model.embedTokens }
+
+    public func dflashEmbed(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(Self.mtpTokenBatch(tokens))
+    }
+
+    public func dflashLmHead(_ hidden: MLXArray) -> MLXArray {
+        mtpLmHead(hidden)
+    }
+
+    public func dflashVerify(
+        _ tokens: MLXArray, cache: [KVCache]?, tapLayerIds: [Int]
+    ) -> (logits: MLXArray, fused: MLXArray) {
+        let ids = Self.mtpTokenBatch(tokens)
+        let record = DFlashLimits.shouldRecordSpec(sequenceLength: ids.dim(1))
+        let (normed, fused) = model.forwardTapped(
+            ids, cache: cache, tapLayerIds: Set(tapLayerIds), recordSpec: record)
+        return (mtpLmHead(normed), fused)
+    }
+
+    public func dflashRollback(cache: [KVCache], nRejected: Int, specWidth: Int) {
+        model.rollbackDFlash(cache: cache, nRejected: nRejected, specWidth: specWidth)
+    }
+}
+
+extension Qwen35TextModel: MtpTarget {
+    public func mtpEmbed(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(Self.mtpTokenBatch(tokens))
+    }
+
+    public func mtpLmHead(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        return model.embedTokens.asLinear(hidden)
+    }
+
+    public func mtpHiddenAndLogits(_ tokens: MLXArray, cache: [KVCache]?) -> (
+        hidden: MLXArray, logits: MLXArray
+    ) {
+        let hidden = model(Self.mtpTokenBatch(tokens), cache: cache)
+        return (hidden, mtpLmHead(hidden))
+    }
+}
+
 // MARK: - Top-level Model
 
-public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider, CompiledDecodeReporting {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -1240,6 +1396,8 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         self.kvHeads = textModel.kvHeads
         _languageModel.wrappedValue = textModel
     }
+
+    public var compiledDecodeSegmentCount: Int { languageModel.compiledDecodeSegmentCount }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
@@ -1288,6 +1446,44 @@ extension Qwen35Model: LoRAModel {
 
 extension Qwen35Model: SpeculativeCacheRewindModel {
     public var maximumNativeTargetCacheRewind: Int { 1 }
+}
+
+extension Qwen35Model: MtpTarget {
+    public func mtpEmbed(_ tokens: MLXArray) -> MLXArray {
+        languageModel.mtpEmbed(tokens)
+    }
+
+    public func mtpLmHead(_ hidden: MLXArray) -> MLXArray {
+        languageModel.mtpLmHead(hidden)
+    }
+
+    public func mtpHiddenAndLogits(_ tokens: MLXArray, cache: [KVCache]?) -> (
+        hidden: MLXArray, logits: MLXArray
+    ) {
+        languageModel.mtpHiddenAndLogits(tokens, cache: cache)
+    }
+}
+
+extension Qwen35Model: DFlashTarget {
+    public var dflashEmbedding: Embedding { languageModel.dflashEmbedding }
+
+    public func dflashEmbed(_ tokens: MLXArray) -> MLXArray {
+        languageModel.dflashEmbed(tokens)
+    }
+
+    public func dflashLmHead(_ hidden: MLXArray) -> MLXArray {
+        languageModel.dflashLmHead(hidden)
+    }
+
+    public func dflashVerify(
+        _ tokens: MLXArray, cache: [KVCache]?, tapLayerIds: [Int]
+    ) -> (logits: MLXArray, fused: MLXArray) {
+        languageModel.dflashVerify(tokens, cache: cache, tapLayerIds: tapLayerIds)
+    }
+
+    public func dflashRollback(cache: [KVCache], nRejected: Int, specWidth: Int) {
+        languageModel.dflashRollback(cache: cache, nRejected: nRejected, specWidth: specWidth)
+    }
 }
 
 // MARK: - Chat conventions

@@ -363,8 +363,16 @@ public class FusedGateUpSwitchGLU: Module {
 // MARK: - SwitchLinear
 
 public class SwitchLinear: Module, Quantizable {
-    @ModuleInfo(key: "weight") var weight: MLXArray
-    @ModuleInfo(key: "bias") var bias: MLXArray?
+    // NovaMLX-TIE: `public` (was internal) to allow Phase 3 lazy weight loading.
+    @ModuleInfo(key: "weight") public var weight: MLXArray
+    @ModuleInfo(key: "bias") public var bias: MLXArray?
+
+    /// NovaMLX-TIE Phase 6: when per-expert streaming fires, the sync hook
+    /// assigns a small stacked weight [k, out, in] (only activated experts)
+    /// and sets this to the local-index remapping of `indices`. The patched
+    /// callAsFunction checks this and uses it instead of the original global
+    /// indices for gatherMM. nil = use indices as-is (whole-layer mode).
+    public var tieLocalIndices: MLXArray? = nil
 
     let inputDims: Int
     let outputDims: Int
@@ -408,11 +416,18 @@ public class SwitchLinear: Module, Quantizable {
     public func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
+        // NovaMLX-TIE: sync hook (Phase 3 lazy weight load / Phase 6 per-expert) + async hook (heat-map).
+        TierHooks.switchLinearSyncHook?(self, indices)
+        TierHooks.switchLinearHook?(self, indices)
+        // Phase 6: sync hook may have set tieLocalIndices for per-expert streaming.
+        let effectiveIndices = tieLocalIndices ?? indices
+        let useBiasIndices = tieLocalIndices != nil ? effectiveIndices : indices
+        defer { tieLocalIndices = nil }
         let weightT = self.weight.swappedAxes(-1, -2)
-        var result = MLX.gatherMM(x, weightT, rhsIndices: indices, sortedIndices: sortedIndices)
+        var result = MLX.gatherMM(x, weightT, rhsIndices: effectiveIndices, sortedIndices: sortedIndices)
 
         if let bias = self.bias {
-            result = result + MLX.expandedDimensions(bias[indices], axis: -2)
+            result = result + MLX.expandedDimensions(bias[useBiasIndices], axis: -2)
         }
 
         return result
@@ -424,8 +439,9 @@ public class SwitchLinear: Module, Quantizable {
 }
 
 public class QuantizedSwitchLinear: SwitchLinear, Quantized {
-    @ModuleInfo(key: "scales") var scales: MLXArray
-    @ModuleInfo(key: "biases") var biases: MLXArray?
+    // NovaMLX-TIE: `public var` (was internal let) for sync hook reassignment.
+    @ModuleInfo(key: "scales") public var scales: MLXArray
+    @ModuleInfo(key: "biases") public var biases: MLXArray?
 
     public let groupSize: Int
     public let bits: Int
@@ -454,12 +470,18 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     override public func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
+        // NovaMLX-TIE: sync hook (Phase 3 lazy weight load / Phase 6 per-expert) + async hook (heat-map).
+        TierHooks.switchLinearSyncHook?(self, indices)
+        TierHooks.switchLinearHook?(self, indices)
+        let effectiveIndices = tieLocalIndices ?? indices
+        let useBiasIndices = tieLocalIndices != nil ? effectiveIndices : indices
+        defer { tieLocalIndices = nil }
         var result = MLX.gatherQuantizedMM(
             x,
             self.weight,
             scales: self.scales,
             biases: self.biases,
-            rhsIndices: indices,
+            rhsIndices: effectiveIndices,
             transpose: true,
             groupSize: self.groupSize,
             bits: self.bits,
@@ -468,7 +490,7 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         )
 
         if let bias = self.bias {
-            result = result + MLX.expandedDimensions(bias[indices], axis: -2)
+            result = result + MLX.expandedDimensions(bias[useBiasIndices], axis: -2)
         }
 
         return result

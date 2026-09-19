@@ -71,6 +71,8 @@ public enum LLMTypeRegistry {
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
         "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
         "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
+        "qwen4_exp": create(Qwen4ExpConfiguration.self, Qwen4ExpModel.init),
+        "qwen4_exp_text": create(Qwen4ExpTextConfiguration.self, Qwen4ExpTextModel.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
         "starcoder2": create(Starcoder2Configuration.self, Starcoder2Model.init),
         "cohere": create(CohereConfiguration.self, CohereModel.init),
@@ -113,6 +115,7 @@ public enum LLMTypeRegistry {
         "hunyuan_v1_dense": create(HunyuanConfiguration.self, HunyuanModel.init),
         "nemotron_labs_diffusion": create(
             NemotronLabsDiffusionConfiguration.self, NemotronLabsDiffusionModel.init),
+        "hy_v4": create(HyV4Configuration.self, HyV4Model.init),
     ])
 }
 
@@ -508,6 +511,11 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: "Explain quaternions."
     )
 
+    static public let hy4_preview_4bit = ModelConfiguration(
+        id: "mlx-community/Hy4-preview-4bit",
+        defaultPrompt: "Write a concise Swift function that returns the nth Fibonacci number."
+    )
+
     private static func all() -> [ModelConfiguration] {
         [
             codeLlama13b4bit,
@@ -577,6 +585,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             gpt_oss_20b_MXFP4_Q8,
             jamba_3b_4bit,
             nemotron_labs_diffusion_3b_4bit,
+            hy4_preview_4bit,
         ]
     }
 
