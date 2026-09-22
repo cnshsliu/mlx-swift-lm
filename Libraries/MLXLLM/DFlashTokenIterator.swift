@@ -27,6 +27,7 @@ public struct DFlashTokenIterator: TokenIteratorProtocol {
     private let maskId: Int
     private let tap: [Int]
     private let greedy: Bool
+    private var stopped = false
 
     public init(
         input: LMInput,
@@ -103,38 +104,52 @@ public struct DFlashTokenIterator: TokenIteratorProtocol {
         let draftArr = drafter.selectBlock(
             block: block, targetHidden: pendingCtx, cache: draftCache,
             cap: thisCap, anchorId: pending)
-        eval(draftArr)
-        let drafted = draftArr.asArray(Int.self)
-
-        var verifyList = [Int32(pending)]
-        verifyList.append(contentsOf: drafted.map { Int32($0) })
-        let verifyIds = MLXArray(verifyList, [1, verifyList.count])
+        let anchor = MLXArray(Int32(pending)).reshaped([1, 1])
+        let verifyIds = concatenated([anchor, draftArr.reshaped(1, -1)], axis: 1)
         let (vLogits, vFused) = target.dflashVerify(
             verifyIds, cache: mainCache, tapLayerIds: tap)
+        eval(vLogits, vFused, draftArr)
+
+        let drafted = draftArr.asArray(Int.self)
+        let logitLength = vLogits.dim(1)
+        let fusedLength = vFused.dim(1)
+        let lengthsAgree = logitLength == drafted.count + 1 && fusedLength == drafted.count + 1
         var argmax = [Int]()
-        let seq = vLogits.dim(1)
-        for i in 0 ..< seq {
-            var row = vLogits[0..., i, 0...]
-            row = processor?.process(logits: row) ?? row
-            argmax.append(argMax(row, axis: -1).item(Int.self))
+        if lengthsAgree {
+            for i in 0 ..< logitLength {
+                var row = vLogits[0..., i, 0...]
+                row = processor?.process(logits: row) ?? row
+                argmax.append(argMax(row, axis: -1).item(Int.self))
+            }
         }
-        let result = DFlashAccept.greedy(drafted: drafted, targetArgmax: argmax)
-        let n = result.accepted
+        let greedy = DFlashAccept.greedy(drafted: drafted, targetArgmax: argmax)
+        let decision = DFlashBlockCheck.decide(
+            draftCount: drafted.count,
+            logitLength: logitLength,
+            fusedLength: fusedLength,
+            accepted: lengthsAgree ? greedy.accepted : -1)
         totalProposed += drafted.count
-        totalAccepted += n
-        onSpeculationRound?(drafted.count, n)
-        target.dflashRollback(cache: mainCache, nRejected: drafted.count - n, specWidth: 1 + drafted.count)
+        totalAccepted += decision.acceptNormally ? greedy.accepted : 0
+        onSpeculationRound?(drafted.count, decision.acceptNormally ? greedy.accepted : 0)
+        target.dflashRollback(
+            cache: mainCache, nRejected: decision.nRejected, specWidth: decision.specWidth)
+        guard decision.acceptNormally else {
+            stopped = true
+            return
+        }
+        let n = greedy.accepted
         pendingCtx = vFused[0..., ..<(n + 1), 0...]
-        pendingTokens.append(contentsOf: result.committed)
-        if let last = result.committed.last {
+        pendingTokens.append(contentsOf: greedy.committed)
+        if let last = greedy.committed.last {
             pending = last
-            for tid in result.committed {
+            for tid in greedy.committed {
                 processor?.didSample(token: MLXArray([Int32(tid)]))
             }
         }
     }
 
     public mutating func next() -> Int? {
+        if stopped { return nil }
         if pendingIndex < pendingTokens.count {
             let t = pendingTokens[pendingIndex]
             pendingIndex += 1
