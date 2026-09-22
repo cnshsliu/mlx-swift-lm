@@ -69,6 +69,34 @@ public enum DFlashAccept: Sendable {
     }
 }
 
+/// Whether one realized DFlash block may commit tokens.
+/// `specWidth` is the token width submitted to verify (anchor plus drafts).
+public enum DFlashBlockCheck: Sendable {
+    public struct Decision: Equatable, Sendable {
+        public let acceptNormally: Bool
+        public let specWidth: Int
+        public let nRejected: Int
+    }
+
+    public static func decide(
+        draftCount: Int, logitLength: Int, fusedLength: Int, accepted: Int
+    ) -> Decision {
+        let width = draftCount + 1
+        let lengthsAgree = logitLength == width && fusedLength == width
+        let acceptedInRange = accepted >= 0 && accepted <= draftCount
+        if lengthsAgree && acceptedInRange {
+            return Decision(
+                acceptNormally: true,
+                specWidth: width,
+                nRejected: draftCount - accepted)
+        }
+        return Decision(
+            acceptNormally: false,
+            specWidth: width,
+            nRejected: draftCount)
+    }
+}
+
 /// DFlash2 / GDN interaction limits. The old 8192 prompt cap was a workaround
 /// for recording a full-prefill spec capture, then verifying a short block
 /// against that stale conv window (`mlx_reshape` SIGTRAP).
