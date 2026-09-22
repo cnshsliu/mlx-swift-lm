@@ -215,19 +215,15 @@ public final class DFlashCandidateSelector: Module {
 
     public func walkGreedy(scores: MLXArray, candidateIds: MLXArray) -> MLXArray {
         let g = scores.dim(0)
-        func idAt(_ position: Int, _ index: MLXArray) -> MLXArray {
-            take(candidateIds[position], index.reshaped([1]), axis: 0).reshaped([1])
-        }
-        var idx = argMax(scores[0, 0, 0...], axis: -1)
-        var picks: [MLXArray] = [idAt(0, idx)]
+        var idx = argMax(scores[0, 0, 0...], axis: -1).item(Int.self)
+        var picks = [candidateIds[0, idx].item(Int32.self)]
         if g > 1 {
             for s in 1 ..< g {
-                let row = take(scores[s], idx.reshaped([1]), axis: 0)
-                idx = argMax(row, axis: -1)
-                picks.append(idAt(s, idx))
+                idx = argMax(scores[s, idx, 0...], axis: -1).item(Int.self)
+                picks.append(candidateIds[s, idx].item(Int32.self))
             }
         }
-        return concatenated(picks, axis: 0)
+        return MLXArray(picks)
     }
 }
 
