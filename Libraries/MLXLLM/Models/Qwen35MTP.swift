@@ -70,9 +70,11 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel, LLMMode
 {
     public let configuration: Qwen35TextConfiguration
     // The Qwen3.5/3.8 MTP head chains autoregressively (each mtpForward feeds
-    // its hidden back in), and holds ~95% greedy acceptance out to a block of
-    // 4 — oMLX's Lightning MTP runs the same head at depth 4. A block of 2
-    // (one draft + bonus) capped the speedup at ~1.1-2x.
+    // its hidden back in). Depth ladder measured on the 27B oQ8e: block 4
+    // (~33-35 tok/s vs 21.5 serial) is the sweet spot — deeper blocks lose
+    // more to acceptance collapse (block 6: 13 tok/s, block 8: 11) than the
+    // near-free verify batching gains, matching oMLX's adaptive depth
+    // settling at ~4.
     public let maximumBlockSize: Int? = 4
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
