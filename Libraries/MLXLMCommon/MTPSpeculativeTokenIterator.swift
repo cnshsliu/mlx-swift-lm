@@ -98,6 +98,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         public let acceptMs: Double
         /// Rollback / reconcile / cache bookkeeping after acceptance.
         public let postMs: Double
+        /// commitDrafterState (seed computation) within post.
+        public let drafterCommitMs: Double
+        /// Rollback + reconcile + bookkeeping within post.
+        public let rollbackMs: Double
     }
     public var mtpRoundTimingNote: ((MTPRoundTiming) -> Void)?
 
@@ -523,8 +527,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         mainState = mainResult.state
         let verifyMs = Double(DispatchTime.now().uptimeNanoseconds - roundT0.uptimeNanoseconds) / 1e6 - draftMs
 
-        eval(flatDraftTokens)
-        let draftTokensList = flatDraftTokens.asArray(Int.self)
+        // Draft tokens stay on GPU: the verify input concatenates them
+        // lazily, so the draft chain's GPU execution overlaps with the
+        // verify's 13ms graph-building instead of serializing before it.
+        // Both sync together at the first .asArray in the acceptance loop.
 
         var accepted = 0
         var finalToken: MLXArray?
@@ -532,12 +538,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         if processor == nil {
             // Stateless greedy fast path: one argmax over the whole verify
             // window and a single GPU sync, instead of a sample+item round
-            // trip per position. Semantics match the loop below exactly —
-            // every position's greedy pick is appended, acceptance stops at
-            // the first mismatch, and the mismatching pick doubles as the
-            // emitted correction.
+            // trip per position. The draft tokens sync here too — the GPU
+            // has already produced them (the verify depended on them).
             let window = mainLogits[0..., verifyStart..., 0...]
             let picked = MLX.argMax(window, axis: -1).flattened().asArray(Int.self)
+            let draftTokensList = flatDraftTokens.asArray(Int.self)
             for i in 0 ..< numDraft {
                 pendingTokens.append(picked[i])
                 if picked[i] == draftTokensList[i] {
@@ -553,6 +558,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 finalToken = MLXArray([Int32(bonus)])
             }
         } else {
+            let draftTokensList = flatDraftTokens.asArray(Int.self)
             for i in 0 ..< numDraft {
                 var logits = mainLogits[0..., verifyStart + i, 0...]
                 logits = processor!.process(logits: logits) ?? logits
@@ -605,6 +611,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             draftModelCalls: 1
         )
 
+        let postCommitT0 = DispatchTime.now()
         if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
             var currentDrafterState = drafterState
         {
@@ -620,14 +627,21 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             drafterState = currentDrafterState
         }
 
+        let postCommitMs = Double(DispatchTime.now().uptimeNanoseconds - postCommitT0.uptimeNanoseconds) / 1e6
         let rejected = numDraft - accepted
         let snapshotPlaced: Bool
+        let rbT0 = DispatchTime.now()
+        var rbCptMs = 0.0
+        var rbDfMs = 0.0
         if nativeHybridRewind {
             if rejected == 0 {
                 mainCacheStorage.commitProcessedTokens(verifyInput.cacheSequenceLength)
+                rbCptMs = Double(DispatchTime.now().uptimeNanoseconds - rbT0.uptimeNanoseconds) / 1e6
                 // Round-scoped captures must not leak into the next round.
                 (mainModel as? any DFlashTarget)?.dflashRollback(
                     cache: mainCache, nRejected: 0, specWidth: numDraft + 1)
+                rbDfMs = Double(DispatchTime.now().uptimeNanoseconds - rbT0.uptimeNanoseconds) / 1e6 - rbCptMs
+                FileHandle.standardError.write(Data("[MTP-rb] cpt=\(rbCptMs) df=\(rbDfMs)\n".utf8))
             } else if let dflashTarget = mainModel as? any DFlashTarget {
                 // Depth-N rewind: GDN state recomputed from the round capture
                 // at the acceptance point; attention KV trimmed by rejected.
@@ -646,6 +660,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             snapshotPlaced = reconcileSharedKVState(
                 &mainState, discarding: rejected,
                 lengths: mainCacheStorage.emittedLength(forLeaf:))
+            let rbRecMs = Double(DispatchTime.now().uptimeNanoseconds - rbT0.uptimeNanoseconds) / 1e6
+            FileHandle.standardError.write(Data("[MTP-rb] rec=\(rbRecMs - rbDfMs - rbCptMs) total_rb=\(rbRecMs)\n".utf8))
         } else {
             // Staged layers never held rejected rows; write-through layers clamp back over them.
             let commit = mainCacheStorage.commit(round!, retaining: accepted + 1)
@@ -661,7 +677,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         mtpRoundTimingNote?(
             MTPRoundTiming(
                 draftMs: draftMs, verifyMs: verifyMs, commitMs: commitMs,
-                acceptMs: acceptMs, postMs: commitMs - acceptMs))
+                acceptMs: acceptMs, postMs: commitMs - acceptMs,
+                drafterCommitMs: postCommitMs,
+                rollbackMs: commitMs - acceptMs - postCommitMs))
 
         guard snapshotPlaced else {
             switchToPassthrough(reason: Self.missingSharedKVSourcesReason)
