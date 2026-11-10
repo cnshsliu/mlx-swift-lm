@@ -94,6 +94,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         public let draftMs: Double
         public let verifyMs: Double
         public let commitMs: Double
+        /// Acceptance loop (first sync pays the verify forward's GPU time).
+        public let acceptMs: Double
+        /// Rollback / reconcile / cache bookkeeping after acceptance.
+        public let postMs: Double
     }
     public var mtpRoundTimingNote: ((MTPRoundTiming) -> Void)?
 
@@ -524,19 +528,57 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         var accepted = 0
         var finalToken: MLXArray?
-        for i in 0 ..< numDraft {
-            var logits = mainLogits[0..., verifyStart + i, 0...]
-            logits = processor?.process(logits: logits) ?? logits
-            let targetToken = sampler.sample(logits: logits)
-            eval(targetToken)
-            let targetTokenValue = targetToken.item(Int.self)
-            processor?.didSample(token: targetToken)
-            pendingTokens.append(targetTokenValue)
-            guard targetTokenValue == draftTokensList[i] else {
-                finalToken = targetToken
-                break
+        let acceptT0 = DispatchTime.now()
+        if processor == nil {
+            // Stateless greedy fast path: one argmax over the whole verify
+            // window and a single GPU sync, instead of a sample+item round
+            // trip per position. Semantics match the loop below exactly —
+            // every position's greedy pick is appended, acceptance stops at
+            // the first mismatch, and the mismatching pick doubles as the
+            // emitted correction.
+            let window = mainLogits[0..., verifyStart..., 0...]
+            let picked = MLX.argMax(window, axis: -1).flattened().asArray(Int.self)
+            for i in 0 ..< numDraft {
+                pendingTokens.append(picked[i])
+                if picked[i] == draftTokensList[i] {
+                    accepted += 1
+                } else {
+                    finalToken = MLXArray([Int32(picked[i])])
+                    break
+                }
             }
-            accepted += 1
+            if finalToken == nil {
+                let bonus = picked[numDraft]
+                pendingTokens.append(bonus)
+                finalToken = MLXArray([Int32(bonus)])
+            }
+        } else {
+            for i in 0 ..< numDraft {
+                var logits = mainLogits[0..., verifyStart + i, 0...]
+                logits = processor!.process(logits: logits) ?? logits
+                let targetToken = sampler.sample(logits: logits)
+                eval(targetToken)
+                let targetTokenValue = targetToken.item(Int.self)
+                processor!.didSample(token: targetToken)
+                pendingTokens.append(targetTokenValue)
+                guard targetTokenValue == draftTokensList[i] else {
+                    finalToken = targetToken
+                    break
+                }
+                accepted += 1
+            }
+
+            // Only the all-accepted path samples the bonus row. On rejection
+            // the mismatching target sample above is the emitted correction.
+            if finalToken == nil {
+                var logits = mainLogits[0..., verifyStart + accepted, 0...]
+                logits = processor!.process(logits: logits) ?? logits
+                let bonus = sampler.sample(logits: logits)
+                eval(bonus)
+                processor!.didSample(token: bonus)
+                pendingTokens.append(bonus.item(Int.self))
+                finalToken = bonus
+            }
         }
 
         // Only the all-accepted path samples the bonus row. On rejection the
@@ -615,7 +657,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // instrumentation for MTP round-cost profiling.
         let totalMs = Double(DispatchTime.now().uptimeNanoseconds - roundT0.uptimeNanoseconds) / 1e6
         let commitMs = totalMs - draftMs - verifyMs
-        mtpRoundTimingNote?(MTPRoundTiming(draftMs: draftMs, verifyMs: verifyMs, commitMs: commitMs))
+        let acceptMs = Double(DispatchTime.now().uptimeNanoseconds - acceptT0.uptimeNanoseconds) / 1e6
+        mtpRoundTimingNote?(
+            MTPRoundTiming(
+                draftMs: draftMs, verifyMs: verifyMs, commitMs: commitMs,
+                acceptMs: acceptMs, postMs: commitMs - acceptMs))
 
         guard snapshotPlaced else {
             switchToPassthrough(reason: Self.missingSharedKVSourcesReason)
