@@ -1529,3 +1529,69 @@ extension Qwen35 {
     public var toolCallFormat: ToolCallFormat? { .qwen35 }
     public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
 }
+
+// NOVAMLX_DFLASH_HOOK
+extension Qwen35Language.Model {
+    func novamlxDFlashForward(
+        _ inputs: MLXArray, cache: [KVCache?]?, tapLayerIds: Set<Int>
+    ) -> (normed: MLXArray, fused: MLXArray) {
+        var hiddenStates = embedTokens(inputs)
+        var cacheArray = cache
+        if cacheArray == nil {
+            cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
+        }
+        let faMaskMode = createAttentionMask(
+            h: hiddenStates, cache: cacheArray?[faIdx], returnArray: true)
+        let faMask: MLXArray?
+        if case .array(let arrayMask) = faMaskMode {
+            faMask = arrayMask
+        } else {
+            faMask = nil
+        }
+        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        var captured: [MLXArray] = []
+        for (index, layer) in layers.enumerated() {
+            let layerSSMMask = layer.isLinear ? ssmMask : nil
+            hiddenStates = layer(
+                hiddenStates,
+                attentionMask: faMask,
+                ssmMask: layerSSMMask,
+                cache: cacheArray?[index],
+                positionIds: nil,
+                checkpointAfter: nil)
+            if tapLayerIds.contains(index) {
+                captured.append(hiddenStates)
+            }
+        }
+        let fused: MLXArray
+        if captured.isEmpty {
+            fused = hiddenStates
+        } else if captured.count == 1 {
+            fused = captured[0]
+        } else {
+            fused = concatenated(captured, axis: -1)
+        }
+        return (norm(hiddenStates), fused)
+    }
+}
+
+extension Qwen35 {
+    public var novamlxDFlashEmbedding: Embedding { languageModel.model.embedTokens }
+
+    public func novamlxDFlashLmHead(_ hidden: MLXArray) -> MLXArray {
+        if let head = languageModel.lmHead {
+            return head(hidden)
+        }
+        return languageModel.model.embedTokens.asLinear(hidden)
+    }
+
+    public func novamlxDFlashVerify(
+        _ tokens: MLXArray, cache: [KVCache]?, tapLayerIds: [Int]
+    ) -> (logits: MLXArray, fused: MLXArray) {
+        let ids = tokens.ndim == 1 ? tokens.reshaped(1, -1) : tokens
+        let optional = cache.map { $0.map { $0 as KVCache? } }
+        let (normed, fused) = languageModel.model.novamlxDFlashForward(
+            ids, cache: optional, tapLayerIds: Set(tapLayerIds))
+        return (novamlxDFlashLmHead(normed), fused)
+    }
+}

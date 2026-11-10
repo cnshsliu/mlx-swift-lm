@@ -112,6 +112,84 @@ public enum DFlashLimits: Sendable {
     }
 }
 
+/// Per-request draft length. `cap == 0` is one target token and no drafter call.
+/// Starts at `maxCap`. After `minRoundsBeforePark` speculative rounds, a rolling
+/// mean of accepted draft tokens below `parkBelow` parks the drafter.
+/// A parked request stays at cap 0. A full-width probe costs a wide verify, which
+/// on this model is the slow part, so it does not buy its way back on. A later
+/// speculative round that does run can still leave the park when it accepts
+/// at least `parkBelow` tokens.
+public struct DFlashCapPolicy: Sendable {
+    public let maxCap: Int
+    public private(set) var cap: Int
+    public private(set) var rounds: Int
+    public let windowSize: Int
+    public let parkBelow: Double
+    public let minRoundsBeforePark: Int
+    public let probeEvery: Int
+    private var acceptedWindow: [Int]
+    private var parked: Bool
+
+    public init(
+        maxCap: Int,
+        windowSize: Int = 4,
+        parkBelow: Double = 3,
+        minRoundsBeforePark: Int = 3,
+        probeEvery: Int = 32
+    ) {
+        let maxCap = Swift.max(1, maxCap)
+        self.maxCap = maxCap
+        self.cap = maxCap
+        self.rounds = 0
+        self.windowSize = Swift.max(1, windowSize)
+        self.parkBelow = parkBelow
+        self.minRoundsBeforePark = Swift.max(1, minRoundsBeforePark)
+        self.probeEvery = Swift.max(2, probeEvery)
+        self.acceptedWindow = []
+        self.parked = false
+    }
+
+    public mutating func observe(accepted: Int, capUsed: Int) {
+        rounds += 1
+        if capUsed <= 0 {
+            cap = 0
+            return
+        }
+        let accepted = Swift.max(0, accepted)
+        if parked {
+            if Double(accepted) >= parkBelow {
+                parked = false
+                acceptedWindow = [accepted]
+                cap = Swift.min(maxCap, accepted + 1)
+            } else {
+                cap = 0
+            }
+            return
+        }
+        acceptedWindow.append(accepted)
+        if acceptedWindow.count > windowSize {
+            acceptedWindow.removeFirst()
+        }
+        if acceptedWindow.count < minRoundsBeforePark {
+            cap = maxCap
+            return
+        }
+        let mean = Double(acceptedWindow.reduce(0, +)) / Double(acceptedWindow.count)
+        if mean < parkBelow {
+            parked = true
+            cap = 0
+            return
+        }
+        if accepted >= capUsed {
+            let opened = capUsed < maxCap ? capUsed + 1 : maxCap
+            cap = Swift.min(maxCap, Swift.max(cap, opened))
+            return
+        }
+        let withHeadroom = Int(mean.rounded()) + 1
+        cap = Swift.min(maxCap, Swift.max(1, withHeadroom))
+    }
+}
+
 /// Target that can feed a DFlash drafter (hidden-state taps + hybrid rollback).
 public protocol DFlashTarget: LanguageModel {
     var dflashEmbedding: Embedding { get }

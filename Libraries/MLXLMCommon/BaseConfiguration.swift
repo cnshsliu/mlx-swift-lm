@@ -87,16 +87,39 @@ public struct BaseConfiguration: Codable, Sendable {
         /// - Parameter layer: The path/name of the layer.
         /// - Returns: The `Quantization` settings to apply, or `nil` if the layer should be skipped.
         public func quantization(layer: String) -> Quantization? {
-            if let perLayer = perLayerQuantization[layer] {
-                switch perLayer {
-                case .skip:
-                    return nil
-                case .quantize(let quantization):
-                    return quantization
+            for candidate in Self.aliases(for: layer) {
+                if let perLayer = perLayerQuantization[candidate] {
+                    switch perLayer {
+                    case .skip:
+                        return nil
+                    case .quantize(let quantization):
+                        return quantization
+                    }
                 }
-            } else {
-                return quantization
             }
+            return quantization
+        }
+
+        /// Config keys are often `model.layers…shard_0` while Module paths are
+        /// `language_model.model.layers…shards.0`.
+        static func aliases(for layer: String) -> [String] {
+            var names = [layer]
+            var trimmed = layer
+            if trimmed.hasPrefix("language_model.") {
+                trimmed = String(trimmed.dropFirst("language_model.".count))
+                names.append(trimmed)
+            }
+            if trimmed.contains(".ngram_embedding.shards.") {
+                names.append(
+                    trimmed.replacingOccurrences(
+                        of: ".ngram_embedding.shards.", with: ".ngram_embedding.shard_"))
+            }
+            if trimmed.contains(".ngram_embedding.shard_") {
+                names.append(
+                    trimmed.replacingOccurrences(
+                        of: ".ngram_embedding.shard_", with: ".ngram_embedding.shards."))
+            }
+            return names
         }
     }
 

@@ -163,6 +163,33 @@ public class Qwen3ModelInner: Module {
 
         return norm(h)
     }
+
+    /// Forward pass that also captures post-layer residual hiddens at `tapLayerIds`
+    /// (concatenated channel-wise) for DFlash/DSpark drafters.
+    func forwardTapped(
+        _ inputs: MLXArray, cache: [KVCache]?, tapLayerIds: Set<Int>
+    ) -> (normed: MLXArray, fused: MLXArray) {
+        var h = embedTokens(inputs)
+
+        let mask = createAttentionMask(h: h, cache: cache?.first)
+
+        var captured: [MLXArray] = []
+        for (i, layer) in layers.enumerated() {
+            h = layer(h, mask: mask, cache: cache?[i])
+            if tapLayerIds.contains(i) {
+                captured.append(h)
+            }
+        }
+        let fused: MLXArray
+        if captured.isEmpty {
+            fused = h
+        } else if captured.count == 1 {
+            fused = captured[0]
+        } else {
+            fused = concatenated(captured, axis: -1)
+        }
+        return (norm(h), fused)
+    }
 }
 
 public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
@@ -279,6 +306,40 @@ extension Qwen3Configuration: ModelConfigurationValidating {
 extension Qwen3Model: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
+    }
+}
+
+// MARK: - DFlashTarget
+
+extension Qwen3Model: DFlashTarget {
+    public var dflashEmbedding: Embedding { model.embedTokens }
+
+    public func dflashEmbed(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens.ndim == 1 ? tokens.reshaped(1, -1) : tokens)
+    }
+
+    public func dflashLmHead(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        return model.embedTokens.asLinear(hidden)
+    }
+
+    public func dflashVerify(
+        _ tokens: MLXArray, cache: [KVCache]?, tapLayerIds: [Int]
+    ) -> (logits: MLXArray, fused: MLXArray) {
+        let ids = tokens.ndim == 1 ? tokens.reshaped(1, -1) : tokens
+        let (normed, fused) = model.forwardTapped(
+            ids, cache: cache, tapLayerIds: Set(tapLayerIds))
+        return (dflashLmHead(normed), fused)
+    }
+
+    /// Dense attention only — rollback is a KV trim, no recurrent state to replay.
+    public func dflashRollback(cache: [KVCache], nRejected: Int, specWidth: Int) {
+        guard nRejected > 0 else { return }
+        for c in cache where c.isTrimmable {
+            _ = c.trim(nRejected)
+        }
     }
 }
 

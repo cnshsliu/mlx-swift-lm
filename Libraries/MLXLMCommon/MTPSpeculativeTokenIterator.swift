@@ -87,6 +87,16 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         telemetry.roundCount > 0 ? telemetry : nil
     }
 
+    /// Round-phase timing breakdown for MTP round-cost profiling. NovaMLX
+    /// attaches a logger here; MLXLMCommon itself keeps no dependency on a
+    /// logging system.
+    public struct MTPRoundTiming: Sendable {
+        public let draftMs: Double
+        public let verifyMs: Double
+        public let commitMs: Double
+    }
+    public var mtpRoundTimingNote: ((MTPRoundTiming) -> Void)?
+
     public mutating func discardGeneratedToken() {
         telemetry.discardGeneratedToken()
     }
@@ -453,6 +463,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         )
 
         let bonusToken = y.tokens
+        let roundT0 = DispatchTime.now()
         let draftTokens: MLXArray
         if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
             var currentDrafterState = drafterState
@@ -482,6 +493,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             )
         }
         // draftTokens shape [B, numDraft] -> flatten to [numDraft].
+        let draftMs = Double(DispatchTime.now().uptimeNanoseconds - roundT0.uptimeNanoseconds) / 1e6
         let flatDraftTokens = draftTokens.flattened()
 
         // Verify pass: main model evaluates [bonus, draft_1, ..., draft_numDraft]
@@ -491,12 +503,21 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let verifyTokens = concatenated([bonusToken, flatDraftTokens])
         let verifyInput = LMInput.Text(tokens: verifyTokens)
         let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
-        verifyState[mtpCacheCheckpointIndexKey] = nativeHybridRewind ? 1 : nil
+        // Native hybrid rewind: GDN layers capture the round's inputs so the
+        // rollback recomputes state at any acceptance point. The split
+        // checkpoint (index 1) only ever described depth-1 rounds.
+        if nativeHybridRewind {
+            verifyState[mtpRecordSpecCaptureKey] = true
+            verifyState[mtpCacheCheckpointIndexKey] = nil
+        } else {
+            verifyState[mtpCacheCheckpointIndexKey] = nil
+        }
         let verifyCache = nativeHybridRewind ? mainCache : round!.caches
         let mainResult = mainModel(
             verifyInput[text: .newAxis], cache: verifyCache, state: verifyState)
         let mainLogits = mainResult.logits
         mainState = mainResult.state
+        let verifyMs = Double(DispatchTime.now().uptimeNanoseconds - roundT0.uptimeNanoseconds) / 1e6 - draftMs
 
         eval(flatDraftTokens)
         let draftTokensList = flatDraftTokens.asArray(Int.self)
@@ -562,6 +583,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         if nativeHybridRewind {
             if rejected == 0 {
                 mainCacheStorage.commitProcessedTokens(verifyInput.cacheSequenceLength)
+                // Round-scoped captures must not leak into the next round.
+                (mainModel as? any DFlashTarget)?.dflashRollback(
+                    cache: mainCache, nRejected: 0, specWidth: numDraft + 1)
+            } else if let dflashTarget = mainModel as? any DFlashTarget {
+                // Depth-N rewind: GDN state recomputed from the round capture
+                // at the acceptance point; attention KV trimmed by rejected.
+                dflashTarget.dflashRollback(
+                    cache: mainCache, nRejected: rejected, specWidth: numDraft + 1)
+                mainCacheStorage.commitProcessedTokens(accepted + 1)
             } else {
                 let rewound = rewindSpeculativePromptCache(
                     mainCache, numTokens: rejected)
@@ -569,9 +599,6 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                     rewound == rejected,
                     "Target advertised native speculative rewind depth \(nativeRewindDepth), but rewound \(rewound) of \(rejected) positions"
                 )
-                // Qwen MTP-1: attention KV trims one token while every GDN
-                // cache restores the state captured after the committed bonus.
-                // The target's 9B weights are not replayed on rejection.
                 mainCacheStorage.commitProcessedTokens(accepted + 1)
             }
             snapshotPlaced = reconcileSharedKVState(
@@ -584,6 +611,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 &mainState, discarding: rejected,
                 lengths: { commit.emittedLengths[$0] })
         }
+        // Round timing breakdown — visible via MLXLMCommonLog. Temporary
+        // instrumentation for MTP round-cost profiling.
+        let totalMs = Double(DispatchTime.now().uptimeNanoseconds - roundT0.uptimeNanoseconds) / 1e6
+        let commitMs = totalMs - draftMs - verifyMs
+        mtpRoundTimingNote?(MTPRoundTiming(draftMs: draftMs, verifyMs: verifyMs, commitMs: commitMs))
 
         guard snapshotPlaced else {
             switchToPassthrough(reason: Self.missingSharedKVSourcesReason)
@@ -615,6 +647,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         discardSpeculativePromptCacheCheckpoints(mainCache)
         mainState?[mtpEmitFlagKey] = false
         mainState?[mtpCacheCheckpointIndexKey] = nil
+        mainState?[mtpRecordSpecCaptureKey] = nil
         mainState?[mtpLastHiddenStatesKey] = nil
         mainState?[mtpSharedKVStatesKey] = nil
         mainState?[mtpSharedKVSourceIndicesKey] = nil

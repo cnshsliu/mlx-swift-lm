@@ -526,7 +526,8 @@ public class Qwen3NextModelInner: Module {
     private let decodeSegments: [CompiledDecodeSegment]
     private let compiledSegments: CompiledDecodeSegmentCache
 
-    var compiledDecodeSegmentCount: Int { compiledSegments.compiledCount }
+    /// Number of scheduled single-token compiled segments (traced lazily on first decode).
+    var compiledDecodeSegmentCount: Int { decodeSegments.count }
 
     init(_ args: Qwen3NextConfiguration) {
         precondition(args.vocabularySize > 0)
@@ -719,7 +720,7 @@ public class Qwen3NextModelInner: Module {
     }
 }
 
-public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider, CompiledDecodeReporting {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -738,6 +739,8 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
     }
+
+    public var compiledDecodeSegmentCount: Int { model.compiledDecodeSegmentCount }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         forward(inputs, cache: cache, useCompiledDecode: true)

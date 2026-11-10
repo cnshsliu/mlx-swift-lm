@@ -1128,37 +1128,107 @@ public final class ChatSession {
                                 }
                             }
 
-                            switch decision {
-                            case .prefillAll:
-                                break
+                            // Hybrid GDN / Mamba caches cannot rewind. Prefer the
+                            // chat-template delta when it is a true prefix; otherwise
+                            // append a ChatML new-user turn onto the live ledger so
+                            // Qwen3.5/3.8 (`last_query_index` + `<think>`) does not
+                            // re-prefill the whole prompt.
+                            var forcedContinuation: [Int]? = nil
+                            if case .rebuild = decision,
+                                !cacheState.isTrimmable,
+                                cacheState.mainCacheIsAligned,
+                                !cacheState.cachedTokens.isEmpty,
+                                !containsNewMedia,
+                                !carriesPreparedMedia,
+                                let beforeCount = conversationMessageCountBeforePending,
+                                beforeCount > 0
+                            {
+                                let appended = Array(
+                                    currentConversation.messages.dropFirst(beforeCount))
+                                let prefixMessages =
+                                    leadingMessages
+                                    + Array(currentConversation.messages.prefix(beforeCount))
+                                var prefixContext = additionalContext ?? [:]
+                                prefixContext["add_generation_prompt"] = false
+                                let prefixPrepared = try await processor.prepare(
+                                    input: UserInput(
+                                        chat: prefixMessages,
+                                        processing: processing,
+                                        tools: tools,
+                                        additionalContext: prefixContext))
+                                let prefixTokenIds = prefixPrepared.text.tokens.asArray(Int.self)
+                                if let suffixStart = untrimmableNewTurnSuffixStart(
+                                    promptTokens: promptTokenIds, prefixTokens: prefixTokenIds)
+                                {
+                                    forcedContinuation = Array(promptTokenIds[suffixStart...])
+                                } else if appended.count == 1, appended[0].role == .user {
+                                    let enableThinking =
+                                        (additionalContext?["enable_thinking"] as? Bool) ?? true
+                                    let suffix = untrimmableChatMLContinuation(
+                                        newUserText: appended[0].content,
+                                        cachedTokens: cacheState.cachedTokens,
+                                        imStartId: tokenizer.convertTokenToId("<|im_start|>"),
+                                        imEndId: tokenizer.convertTokenToId("<|im_end|>"),
+                                        encode: {
+                                            tokenizer.encode(text: $0, addSpecialTokens: false)
+                                        },
+                                        enableThinking: enableThinking)
+                                    if !suffix.isEmpty {
+                                        forcedContinuation = suffix
+                                    }
+                                }
+                            }
 
-                            case .appendSuffix(let suffixStart, _):
-                                input = LMInput(
-                                    tokens: MLXArray(Array(promptTokenIds[suffixStart...])))
-                                cachedPromptTokenCount = suffixStart
+                            if let forced = forcedContinuation {
+                                input = LMInput(tokens: MLXArray(forced))
+                                cachedPromptTokenCount = cacheState.cachedTokens.count
+                                currentConversation.cachedTokens = cacheState.cachedTokens + forced
+                                decision = .appendSuffix(
+                                    suffixStart: 0,
+                                    representedTokens: currentConversation.cachedTokens)
+                            } else {
+                                switch decision {
+                                case .prefillAll:
+                                    break
 
-                            case .appendSuffixToMain(let suffixStart, _):
-                                input = LMInput(
-                                    tokens: MLXArray(Array(promptTokenIds[suffixStart...])))
-                                cachedPromptTokenCount = suffixStart
-                                // The draft does not represent the same private
-                                // Harmony path. Preserve the authoritative main
-                                // cache and use it alone for this continuation.
-                                draftKVCache = nil
-                                requiresMainOnlyContinuation = true
+                                case .appendSuffix(let suffixStart, _):
+                                    input = LMInput(
+                                        tokens: MLXArray(Array(promptTokenIds[suffixStart...])))
+                                    cachedPromptTokenCount = suffixStart
 
-                            case .trimToCommonPrefix(let commonPrefixLength, _):
-                                input = LMInput(
-                                    tokens: MLXArray(
-                                        Array(promptTokenIds.dropFirst(commonPrefixLength))))
-                                cachedPromptTokenCount = commonPrefixLength
+                                case .appendSuffixToMain(let suffixStart, _):
+                                    input = LMInput(
+                                        tokens: MLXArray(Array(promptTokenIds[suffixStart...])))
+                                    cachedPromptTokenCount = suffixStart
+                                    // The draft does not represent the same private
+                                    // Harmony path. Preserve the authoritative main
+                                    // cache and use it alone for this continuation.
+                                    draftKVCache = nil
+                                    requiresMainOnlyContinuation = true
 
-                            case .rebuild:
-                                kvCache = KVCacheStorage(
-                                    try model.newCache(parameters: generateParameters),
-                                    plan: kvCachePlan)
-                                draftKVCache = nil
-                                lmState = nil
+                                case .trimToCommonPrefix(let commonPrefixLength, _):
+                                    input = LMInput(
+                                        tokens: MLXArray(
+                                            Array(promptTokenIds.dropFirst(commonPrefixLength))))
+                                    cachedPromptTokenCount = commonPrefixLength
+
+                                case .rebuild:
+                                    kvCache = KVCacheStorage(
+                                        try model.newCache(parameters: generateParameters),
+                                        plan: kvCachePlan)
+                                    draftKVCache = nil
+                                    lmState = nil
+                                }
+
+                                // Usually the rendered prompt, but a protocol rule may
+                                // keep generated tokens the cold render cannot reproduce.
+                                switch decision {
+                                case .appendSuffix(_, let representedTokens),
+                                    .appendSuffixToMain(_, let representedTokens):
+                                    currentConversation.cachedTokens = representedTokens
+                                case .prefillAll, .trimToCommonPrefix, .rebuild:
+                                    currentConversation.cachedTokens = promptTokenIds
+                                }
                             }
 
                             reusedMainCacheWithoutDraft =
@@ -1167,15 +1237,6 @@ public final class ChatSession {
                                 && !willFallBackBeforeLoadingDraft
                                 && draftKVCache == nil
 
-                            // Usually the rendered prompt, but a protocol rule may
-                            // keep generated tokens the cold render cannot reproduce.
-                            switch decision {
-                            case .appendSuffix(_, let representedTokens),
-                                .appendSuffixToMain(_, let representedTokens):
-                                currentConversation.cachedTokens = representedTokens
-                            case .prefillAll, .trimToCommonPrefix, .rebuild:
-                                currentConversation.cachedTokens = promptTokenIds
-                            }
                             currentConversation.uncommittedTokens.removeAll()
                             conversation = currentConversation
                         }

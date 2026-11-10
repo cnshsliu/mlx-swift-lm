@@ -65,13 +65,28 @@ final class Qwen35MTPPredictor: Module {
     }
 }
 
-public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
+public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel, LLMModel,
+    KVCacheDimensionProvider, MtpDrafter
+{
     public let configuration: Qwen35TextConfiguration
-    public let maximumBlockSize: Int? = 2
+    // The Qwen3.5/3.8 MTP head chains autoregressively (each mtpForward feeds
+    // its hidden back in), and holds ~95% greedy acceptance out to a block of
+    // 4 — oMLX's Lightning MTP runs the same head at depth 4. A block of 2
+    // (one draft + bonus) capped the speedup at ~1.1-2x.
+    public let maximumBlockSize: Int? = 4
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
     private let preconvertedNorms: Bool
+    public var mtpBlockSize: Int { max(configuration.mtpNumHiddenLayers, 2) }
+    public var vocabularySize: Int { configuration.vocabularySize }
+    public var kvHeads: [Int] {
+        Array(repeating: configuration.kvHeads, count: max(configuration.mtpNumHiddenLayers, 1))
+    }
+    public var loraLayers: [Module] { [] }
+
+    private var boundEmbed: ((MLXArray) -> MLXArray)?
+    private var boundLmHead: ((MLXArray) -> MLXArray)?
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPPredictor
 
@@ -166,9 +181,43 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
 
         if let seed = state.seedToken {
             state.seedToken = nil
+            let seedHidden = state.seedHidden
             state.seedHidden = nil
-            state.proposalAppended = 0
-            return seed
+            // The seed is the first drafted token (sampled from the committed
+            // state in commitDrafterState so this round need not re-feed the
+            // bonus). At depth > 1 the remaining drafts chain from
+            // (seed, seedHidden). Returning the seed alone was a block-2
+            // assumption — the verifier indexes draftTokensList[0..<numDraft]
+            // and trapped on deeper blocks.
+            let chainBlock = blockSize - 1
+            if chainBlock <= 1 || seedHidden == nil {
+                // Block-2 seeded round: the seed IS the whole draft. Original
+                // accounting preserved exactly (no appended positions, no
+                // position advance) — deep blocks take the chain path below.
+                state.proposalAppended = 0
+                return seed
+            }
+            let chained = draftMTPTokenBlock(
+                targetEmbedTokens: targetEmbedTokens,
+                lmHead: lmHead,
+                inputEmbedding: inputEmbedding,
+                lastToken: seed,
+                lastHidden: seedHidden!,
+                queryOffset: queryOffset,
+                blockSize: chainBlock,
+                sampler: sampler,
+                cache: state.cache
+            ) { inputsEmbeds, hiddenStates, cache, positionOffset in
+                mtp(
+                    inputsEmbeds: inputsEmbeds,
+                    hiddenStates: hiddenStates,
+                    cache: cache,
+                    positionOffset: positionOffset)
+            }
+            state.proposalAppended = blockSize - 1
+            state.nextPosition += state.proposalAppended
+            return concatenated(
+                [normalizedMTPColumn(seed), chained], axis: 1)
         }
 
         state.proposalAppended = blockSize - 1
@@ -243,6 +292,43 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
             numExperts: configuration.numExperts,
             shiftNormWeights: !preconvertedNorms
         )
+    }
+
+    public func prepare() throws {}
+
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        mtp.newCache()
+    }
+
+    public func mtpNewCache(parameters: GenerateParameters?) -> [KVCache] {
+        mtp.newCache()
+    }
+
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        MLXArray.zeros([inputs.dim(0), inputs.dim(1), vocabularySize])
+    }
+
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        LMOutput(logits: MLXArray.zeros([1, 1, vocabularySize]))
+    }
+
+    public func bindMtp(
+        embed: @escaping (MLXArray) -> MLXArray, lmHead: @escaping (MLXArray) -> MLXArray
+    ) {
+        boundEmbed = embed
+        boundLmHead = lmHead
+    }
+
+    public func mtpForward(tokenEmbed: MLXArray, hidden: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let kv = cache ?? mtp.newCache()
+        let offset = kv.first?.offset ?? 0
+        return mtp(
+            inputsEmbeds: tokenEmbed,
+            hiddenStates: hidden,
+            cache: kv,
+            positionOffset: offset)
     }
 
     private func targetEmbeddingAndHead(_ target: any LanguageModel) -> (Embedding, Linear?) {

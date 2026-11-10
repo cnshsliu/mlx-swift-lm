@@ -405,7 +405,7 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
 
 /// Standard KV cache implementation based on Python's KVCache
 /// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
-public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
+open class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
     public var step = 256
@@ -485,10 +485,10 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         }
     }
 
-    public override var isTrimmable: Bool { true }
+    open override var isTrimmable: Bool { true }
 
     @discardableResult
-    public override func trim(_ n: Int) -> Int {
+    open override func trim(_ n: Int) -> Int {
         let trimmed = min(offset, n)
         offset -= trimmed
         return trimmed
@@ -539,7 +539,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return quantizedCache
     }
 
-    public override func copy() -> any KVCache {
+    open override func copy() -> any KVCache {
         let new = KVCacheSimple()
         new.step = self.step
         let s = self.state
@@ -1321,7 +1321,7 @@ public class ChunkedKVCache: KVCacheSimple {
 }
 
 /// Base cache for array-based state storage
-public class ArraysCache: BaseKVCache {
+open class ArraysCache: BaseKVCache {
     fileprivate var cache: [MLXArray?]
     internal var leftPadding: MLXArray?
     internal var lengths: MLXArray?
@@ -1350,7 +1350,7 @@ public class ArraysCache: BaseKVCache {
         }
     }
 
-    public override func copy() -> any KVCache {
+    open override func copy() -> any KVCache {
         let new = ArraysCache(size: cache.count)
         copyContents(to: new)
         return new
@@ -2490,7 +2490,7 @@ public func quantizedScaledDotProductAttention(
         let kIndices = MLXArray(0 ..< kL)
         let causalMask = greaterEqual(
             expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
-        scores = MLX.where(causalMask, scores, MLXArray.maskFill(for: scores.dtype))
+        scores = MLX.where(causalMask, scores, MLXArray(-Float.greatestFiniteMagnitude, dtype: scores.dtype))
 
     case .array(let maskArray):
         scores = applyMask(maskArray, to: scores)
@@ -2531,7 +2531,7 @@ public func quantizedScaledDotProductAttention(
             maskArray = expandedDimensions(maskArray, axis: -3)
         }
         if maskArray.dtype == .bool {
-            return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
+            return MLX.where(maskArray, scores, MLXArray(-Float.greatestFiniteMagnitude, dtype: scores.dtype))
         } else {
             return scores + maskArray
         }
@@ -2664,11 +2664,11 @@ func applyAttentionMask(
         let kIndices = MLXArray(0 ..< kL)
         let causalMask = greaterEqual(
             expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
-        return MLX.where(causalMask, scores, MLXArray.maskFill(for: scores.dtype))
+        return MLX.where(causalMask, scores, MLXArray(-Float.greatestFiniteMagnitude, dtype: scores.dtype))
 
     case .array(let maskArray):
         if maskArray.dtype == .bool {
-            return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
+            return MLX.where(maskArray, scores, MLXArray(-Float.greatestFiniteMagnitude, dtype: scores.dtype))
         } else {
             return scores + maskArray
         }
@@ -2676,7 +2676,7 @@ func applyAttentionMask(
     case .arrays(let maskArrays):
         if let maskArray = maskArrays.first {
             if maskArray.dtype == .bool {
-                return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
+                return MLX.where(maskArray, scores, MLXArray(-Float.greatestFiniteMagnitude, dtype: scores.dtype))
             } else {
                 return scores + maskArray
             }

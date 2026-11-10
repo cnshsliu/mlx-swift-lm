@@ -339,6 +339,9 @@ final class Qwen35GatedDeltaNet: Module {
         var convInput: MLXArray
         var aLog: MLXArray
         var dtBias: MLXArray
+        /// Cache offset before the round advanced — rollback restores
+        /// `offsetBefore + keep` so positions stay aligned.
+        var offsetBefore: Int = 0
     }
 
     var lastSpecCapture: SpecCapture?
@@ -354,11 +357,14 @@ final class Qwen35GatedDeltaNet: Module {
             cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
         let (out, newConvState, newRecState, checkpoint) = forward(
             inputs, convState: convState, recState: cache?[1], mask: mask,
-            checkpointAfter: checkpointAfter)
+            checkpointAfter: checkpointAfter,
+            offsetBefore: cache?.offset ?? 0)
         if let cache {
             cache[0] = newConvState
             cache[1] = newRecState
-            if let checkpoint, let checkpointAfter {
+            // The spec-capture rewind (rollbackDFlash) restores state by
+            // recomputation; a split checkpoint would be redundant bookkeeping.
+            if let checkpoint, let checkpointAfter, !isRecordingSpec {
                 cache.saveSpeculativeCheckpoint(
                     convState: checkpoint.conv,
                     recurrentState: checkpoint.recurrent,
@@ -380,13 +386,17 @@ final class Qwen35GatedDeltaNet: Module {
     }
 
     /// The GDN body with state passed explicitly in and out so it can be
-    /// traced.
+    /// traced. When `isRecordingSpec` is set the full round's GDN inputs and
+    /// the pre-round recurrent state are captured (in both the split and
+    /// unsplit paths) so a rollback can recompute the state at any acceptance
+    /// point, not just the checkpoint index.
     func forward(
         _ x: MLXArray,
         convState: MLXArray,
         recState: MLXArray?,
         mask: MLXArray?,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        offsetBefore: Int = 0
     ) -> (
         output: MLXArray,
         convState: MLXArray,
@@ -463,6 +473,14 @@ final class Qwen35GatedDeltaNet: Module {
                 checkpointConv = MLXArray.zeros([B, 0, convDim], dtype: qkv.dtype)
             }
             checkpoint = (checkpointConv, prefixState)
+            if isRecordingSpec {
+                lastSpecCapture = SpecCapture(
+                    q: qNormed, k: kNormed, v: v, a: a, b: b,
+                    recState: recState, mask: mask,
+                    convInput: concatenated([convState, qkv], axis: 1),
+                    aLog: aLog, dtBias: dtBias,
+                    offsetBefore: offsetBefore)
+            }
         } else {
             (out, newRecState) = gatedDeltaUpdate(
                 q: qNormed,
@@ -480,7 +498,8 @@ final class Qwen35GatedDeltaNet: Module {
                     q: qNormed, k: kNormed, v: v, a: a, b: b,
                     recState: recState, mask: mask,
                     convInput: concatenated([convState, qkv], axis: 1),
-                    aLog: aLog, dtBias: dtBias)
+                    aLog: aLog, dtBias: dtBias,
+                    offsetBefore: offsetBefore)
             }
         }
 
@@ -951,12 +970,25 @@ public class Qwen35TextModelInner: Module {
         _ inputs: MLXArray,
         cache: [KVCache?]? = nil,
         applyFinalNorm: Bool,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        recordSpec: Bool = false
     ) -> MLXArray {
         if applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
             let step = decodeStep(inputs, caches)
         {
             return step
+        }
+
+        if recordSpec {
+            for layer in layers {
+                layer.linearAttn?.isRecordingSpec = true
+                layer.linearAttn?.lastSpecCapture = nil
+            }
+        }
+        defer {
+            if recordSpec {
+                for layer in layers { layer.linearAttn?.isRecordingSpec = false }
+            }
         }
 
         var hiddenStates = embedTokens(inputs)
@@ -1032,7 +1064,12 @@ public class Qwen35TextModelInner: Module {
     }
 
     func rollbackDFlash(cache: [KVCache], nRejected: Int, specWidth: Int) {
-        guard nRejected > 0 else { return }
+        // Captures are round-scoped: drop them even on the nothing-rejected
+        // fast path so the next round starts clean.
+        guard nRejected > 0 else {
+            for layer in layers { layer.linearAttn?.lastSpecCapture = nil }
+            return
+        }
         for (layer, c) in zip(layers, cache) {
             if layer.isLinear, let mamba = c as? MambaCache, let cap = layer.linearAttn?.lastSpecCapture
             {
@@ -1053,6 +1090,9 @@ public class Qwen35TextModelInner: Module {
                     mask: prefixMask)
                 mamba[0] = contiguous(cap.convInput[0..., keep ..< (keep + window), 0...])
                 mamba[1] = newState
+                // The recurrent cache advanced by the full round during verify;
+                // align it with the kept prefix.
+                mamba.offset = cap.offsetBefore + keep
             } else if c.isTrimmable {
                 _ = c.trim(nRejected)
             }
@@ -1216,9 +1256,11 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Compil
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
         let hiddenStates: MLXArray
         if emitDrafterState {
+            let recordSpec = state?[mtpRecordSpecCaptureKey] ?? false
             let hidden = model.forward(
                 input.tokens, cache: cache, applyFinalNorm: false,
-                checkpointAfter: state?[mtpCacheCheckpointIndexKey])
+                checkpointAfter: recordSpec ? nil : state?[mtpCacheCheckpointIndexKey],
+                recordSpec: recordSpec)
             hiddenStates = model.norm(hidden)
         } else {
             hiddenStates = model(input.tokens, cache: cache)
@@ -1333,7 +1375,9 @@ extension Qwen35TextModel: LoRAModel {
 }
 
 extension Qwen35TextModel: SpeculativeCacheRewindModel {
-    public var maximumNativeTargetCacheRewind: Int { 1 }
+    // Depth-4 native rewind: GDN layers capture the round's inputs and
+    // rollbackDFlash recomputes state at any acceptance point.
+    public var maximumNativeTargetCacheRewind: Int { 4 }
 }
 
 extension Qwen35TextModel: DFlashTarget {
@@ -1445,7 +1489,7 @@ extension Qwen35Model: LoRAModel {
 }
 
 extension Qwen35Model: SpeculativeCacheRewindModel {
-    public var maximumNativeTargetCacheRewind: Int { 1 }
+    public var maximumNativeTargetCacheRewind: Int { 4 }
 }
 
 extension Qwen35Model: MtpTarget {
@@ -1497,4 +1541,33 @@ extension Qwen35Model {
 extension Qwen35TextModel {
     public var toolCallFormat: ToolCallFormat? { .qwen35 }
     public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
+}
+
+// NOVAMLX_DFLASH_HOOK
+extension Qwen35TextModel {
+    public var novamlxDFlashEmbedding: Embedding { dflashEmbedding }
+
+    public func novamlxDFlashLmHead(_ hidden: MLXArray) -> MLXArray {
+        dflashLmHead(hidden)
+    }
+
+    public func novamlxDFlashVerify(
+        _ tokens: MLXArray, cache: [KVCache]?, tapLayerIds: [Int]
+    ) -> (logits: MLXArray, fused: MLXArray) {
+        dflashVerify(tokens, cache: cache, tapLayerIds: tapLayerIds)
+    }
+}
+
+extension Qwen35Model {
+    public var novamlxDFlashEmbedding: Embedding { dflashEmbedding }
+
+    public func novamlxDFlashLmHead(_ hidden: MLXArray) -> MLXArray {
+        dflashLmHead(hidden)
+    }
+
+    public func novamlxDFlashVerify(
+        _ tokens: MLXArray, cache: [KVCache]?, tapLayerIds: [Int]
+    ) -> (logits: MLXArray, fused: MLXArray) {
+        dflashVerify(tokens, cache: cache, tapLayerIds: tapLayerIds)
+    }
 }

@@ -303,6 +303,13 @@ public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
 public let mtpCacheCheckpointIndexKey =
     LMOutput.Key<Int>("mtp.cacheCheckpointIndex")
 
+/// Records the round's GDN inputs and pre-round recurrent state so a rollback
+/// can recompute state at any acceptance point (depth > 1 rewind). Mutually
+/// exclusive with ``mtpCacheCheckpointIndexKey``: the capture makes the split
+/// checkpoint redundant.
+public let mtpRecordSpecCaptureKey =
+    LMOutput.Key<Bool>("mtp.recordSpecCapture")
+
 /// Which cache entry each ``mtpSharedKVStatesKey`` tuple was read from, keyed the same way.
 ///
 /// A speculative round keeps only part of what its verify pass wrote, so the emitted snapshot has

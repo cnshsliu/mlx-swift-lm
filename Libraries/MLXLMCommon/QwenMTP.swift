@@ -10,7 +10,17 @@ package func qwenMTPSanitizeWeights(
     numExperts: Int,
     shiftNormWeights: Bool
 ) -> [String: MLXArray] {
-    var sanitized = weights.filter { key, _ in key.hasPrefix("mtp.") }
+    var remapped = weights
+    let hasNestedMTP = weights.keys.contains { $0.hasPrefix("mtp.") }
+    if !hasNestedMTP {
+        remapped = [:]
+        remapped.reserveCapacity(weights.count)
+        for (key, value) in weights {
+            if key.hasPrefix("model.") || key.hasPrefix("vision_") { continue }
+            remapped[key.hasPrefix("mtp.") ? key : "mtp." + key] = value
+        }
+    }
+    var sanitized = remapped.filter { key, _ in key.hasPrefix("mtp.") }
 
     for layer in 0 ..< max(mtpNumHiddenLayers, 1) {
         let prefix = "mtp.layers.\(layer).mlp"

@@ -448,7 +448,7 @@ public struct ThinkingBudgetProcessor: LogitProcessor {
         }
 
         let masked = MLXArray.full(
-            logits.shape, values: MLXArray.maskFill(for: logits.dtype), dtype: logits.dtype)
+            logits.shape, values: MLXArray(-Float.greatestFiniteMagnitude, dtype: logits.dtype), dtype: logits.dtype)
 
         // Forced transition tokens intentionally override preceding processors.
         // When more than one natural boundary continuation is possible, retain

@@ -105,9 +105,10 @@ package func weightedExpertUnsort(
 // MARK: - SwitchGLU
 
 public class SwitchGLU: Module {
-    @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear
-    @ModuleInfo(key: "up_proj") var upProj: SwitchLinear
-    @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
+    // NovaMLX: public for the Flint rec packer (read-only access).
+    @ModuleInfo(key: "gate_proj") public var gateProj: SwitchLinear
+    @ModuleInfo(key: "up_proj") public var upProj: SwitchLinear
+    @ModuleInfo(key: "down_proj") public var downProj: SwitchLinear
 
     let inputDims: Int
     let hiddenDims: Int
@@ -464,6 +465,23 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
             inputDims: other.inputDims, outputDims: other.outputDims, numExperts: other.numExperts,
             weight: quantizedWeight, bias: other.bias)
 
+        self.freeze()
+    }
+
+    /// Packed MXFP / affine expert stack (oMLX official V4.1 loader).
+    public init(
+        inputDims: Int, outputDims: Int, numExperts: Int,
+        weight: MLXArray, scales: MLXArray, biases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        self._scales.wrappedValue = scales
+        self._biases.wrappedValue = biases
+        super.init(
+            inputDims: inputDims, outputDims: outputDims, numExperts: numExperts,
+            weight: weight, bias: nil)
         self.freeze()
     }
 

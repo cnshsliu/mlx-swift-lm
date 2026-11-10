@@ -306,6 +306,11 @@ public enum PrepareResult {
 /// - calls ``prepare(_:cache:state:prefill:)`` to initialize the KVCache and consume the prompt
 /// - calls ``callAsFunction(_:cache:state:)-9kuvf`` for each token, producing an ``LMOutput``
 /// - the ``TokenIterator`` accumulates this information into a ``GenerateResult``
+/// Models that compile static-shaped single-token decode segments (Qwen3 Next / 3.5 GDN).
+public protocol CompiledDecodeReporting {
+    var compiledDecodeSegmentCount: Int { get }
+}
+
 public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 
     /// Build derived state after checkpoint or adapter topology updates and

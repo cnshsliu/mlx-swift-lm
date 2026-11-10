@@ -219,3 +219,61 @@ struct RewindToCommonPrefixRule: PromptCacheReuseRule {
         return .trimToCommonPrefix(commonPrefixLength: commonPrefixLength, trimCount: trimCount)
     }
 }
+
+/// Index in `promptTokens` where this turn's new tokens begin, when the
+/// live cache cannot be rewound (GDN / Mamba).
+///
+/// Assistant text does not round-trip through the chat template, so the
+/// full render is not a prefix of the generation-time token ledger.
+/// `prefixTokens` is the same template over the conversation *before*
+/// this turn, with `add_generation_prompt` off. If that is a prefix of
+/// the full render, the remainder is the new user turn plus the
+/// generation prompt — safe to prefill onto the untrimmable cache.
+package func untrimmableNewTurnSuffixStart(promptTokens: [Int], prefixTokens: [Int]) -> Int? {
+    guard !prefixTokens.isEmpty,
+        promptTokens.count > prefixTokens.count,
+        promptTokens.starts(with: prefixTokens)
+    else { return nil }
+    return prefixTokens.count
+}
+
+/// ChatML tokens for a new user turn to append onto an untrimmable GDN cache.
+///
+/// Qwen3.5/3.8 templates render historical assistant turns differently
+/// once a later user message exists (`last_query_index` + `<think>`), so
+/// the full re-render is not a prefix of a closed-history render. The
+/// live cache already holds the generated assistant tokens; only the
+/// next user header, content, and generation prompt need to be prefills.
+///
+/// Returns `[]` when the tokenizer is not ChatML (`<|im_start|>` / `<|im_end|>`
+/// missing), so non-ChatML recurrent models still rebuild rather than
+/// splicing the wrong control tokens.
+package func untrimmableChatMLContinuation(
+    newUserText: String,
+    cachedTokens: [Int],
+    imStartId: Int?,
+    imEndId: Int?,
+    encode: (String) -> [Int],
+    enableThinking: Bool
+) -> [Int] {
+    guard let imStartId, let imEndId else { return [] }
+
+    var tokens: [Int] = []
+    if cachedTokens.last != imEndId {
+        tokens.append(imEndId)
+        tokens.append(contentsOf: encode("\n"))
+    }
+    tokens.append(imStartId)
+    tokens.append(contentsOf: encode("user\n"))
+    tokens.append(contentsOf: encode(newUserText))
+    tokens.append(imEndId)
+    tokens.append(contentsOf: encode("\n"))
+    tokens.append(imStartId)
+    tokens.append(contentsOf: encode("assistant\n"))
+    if enableThinking {
+        tokens.append(contentsOf: encode("<think>\n"))
+    } else {
+        tokens.append(contentsOf: encode("<think>\n\n</think>\n\n"))
+    }
+    return tokens
+}

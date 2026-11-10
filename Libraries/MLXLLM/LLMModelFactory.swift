@@ -32,6 +32,11 @@ private struct ArchitectureConfiguration: Decodable {
 
 private func createQwen3CompatibleModel(configuration data: Data) throws -> any LanguageModel {
     let architecture = try JSONDecoder.json5().decode(ArchitectureConfiguration.self, from: data)
+    if architecture.architectures.contains("DFlash2DraftModel")
+        || architecture.architectures.contains("DFlashDraftModel")
+    {
+        return DFlashDraftModel(try DFlashConfig.fromJSON(data))
+    }
     let configuration = try JSONDecoder.json5().decode(Qwen3Configuration.self, from: data)
     try configuration.validateModelConfiguration()
 
@@ -70,6 +75,9 @@ public enum LLMTypeRegistry {
         "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
         "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
+        "qwen3_5_mtp": create(Qwen35Configuration.self, {
+            Qwen35MTPDraftModel($0, preconvertedNorms: true)
+        }),
         "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
         "qwen4_exp": create(Qwen4ExpConfiguration.self, Qwen4ExpModel.init),
         "qwen4_exp_text": create(Qwen4ExpTextConfiguration.self, Qwen4ExpTextModel.init),

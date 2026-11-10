@@ -232,7 +232,7 @@ public final class DFlashCandidateSelector: Module {
 public final class DFlashCtxCache {
     var keys: MLXArray?
     var values: MLXArray?
-    var offset: Int = 0
+    public internal(set) var offset: Int = 0
 }
 
 final class DFlashAttention: Module {
@@ -437,6 +437,17 @@ public final class DFlashDraftModel: Module, LLMModel, KVCacheDimensionProvider 
 
     func projectCtx(_ targetHidden: MLXArray) -> MLXArray {
         hiddenNorm(fc(targetHidden))
+    }
+
+    /// Append target fused states the way a draft forward would, without running the block.
+    /// A dense step (no `selectBlock`) still has to grow this cache or the next draft
+    /// attends over a hole.
+    public func appendContext(_ targetHidden: MLXArray, cache: [DFlashCtxCache]) {
+        let hCtx = projectCtx(targetHidden)
+        for (layer, c) in zip(layers, cache) {
+            _ = layer.selfAttn.appendCtx(hCtx, rope: rope, cache: c)
+        }
+        eval(cache.compactMap(\.keys) + cache.compactMap(\.values))
     }
 
     func forwardHidden(

@@ -31,11 +31,14 @@ extension LLMModel {
         let y = input.text
         let total = y.tokens.size
 
-        // A prompt that fits in one chunk is handed to the iterator whole,
-        // keeping short prompts bitwise-identical to the pre-chunking path.
-        // `.unchunked` (forEachChunk processes nothing) takes the same route
-        // at any prompt length.
-        guard total > stepSize else { return .tokens(y) }
+        // Short prompts stay on the single-forward iterator path (bitwise
+        // identical to the pre-chunking path). Longer prompts always leave
+        // one token for the iterator so `lm_head` stays `[1, 1, vocab]` —
+        // even when `stepSize >= prompt`. Handing a 16k Qwen3.8 prompt to
+        // the iterator would materialize `[1, L, 248k]` logits (~8GB).
+        // `.unchunked` (forEachChunk processes nothing) still takes the
+        // whole-prompt route at any length.
+        guard total > min(stepSize, PrefillParameters.defaultStepSize) else { return .tokens(y) }
 
         var processed = 0
         try withPreparedCache(cache, lengths: y.sequenceLengths) {

@@ -365,12 +365,43 @@ private func topLevelSafetensorURLs(in modelDirectory: URL) -> [URL] {
 /// exist, and otherwise by the conventional `model*.safetensors` names. A model can name extra
 /// files it needs by conforming to ``AdditionalWeightFilesProviding``, and a caller can override
 /// the choice with ``ModelConfiguration/weightFileSelection``.
+/// Optional interceptor: return true when the model was fully loaded.
+/// Recover affine `(groupSize, bits)` from packed `weight` + `scales` when the
+/// config's per-layer table does not match this tensor (e.g. a 4-bit MTP mixer
+/// living next to an 8-bit backbone mixer with the same suffix).
+private func inferAffineQuantSpec(
+    lastDim: Int,
+    packedWeight: MLXArray,
+    scales: MLXArray,
+    mode: QuantizationMode
+) -> (Int, Int, QuantizationMode)? {
+    let nGroups = scales.dim(-1)
+    let packed = packedWeight.dim(-1)
+    guard nGroups > 0, packed > 0, lastDim % nGroups == 0, lastDim % packed == 0 else {
+        return nil
+    }
+    let groupSize = lastDim / nGroups
+    let packFactor = lastDim / packed
+    guard packFactor > 0, 32 % packFactor == 0 else { return nil }
+    let bits = 32 / packFactor
+    guard [2, 4, 8].contains(bits), groupSize >= 32, lastDim % groupSize == 0 else {
+        return nil
+    }
+    return (groupSize, bits, mode)
+}
+
+public nonisolated(unsafe) var customWeightLoader: ((URL, Module) throws -> Bool)?
+
 public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     weightFileSelection: WeightFileSelection = .automatic
 ) throws {
+    if let customWeightLoader, try customWeightLoader(modelDirectory, model) {
+        _ = prepareInferenceState(in: model)
+        return
+    }
     // load the weights and collect metadata from the first safetensor file
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
@@ -389,6 +420,19 @@ public func loadWeights(
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
+    // Qwen3.8-Flash-Next mixed quant: n-gram tables use group 32; vision keys
+    // do not map onto the current PatchEmbed. Drop them so text load can finish.
+    if modelDirectory.path.contains("Flash-Next") {
+        weights = weights.filter { key, _ in
+            if key.contains("vision_tower") || key.contains("patch_embed") { return false }
+            if key.contains("ngram_embedding")
+                && (key.contains("weight_scale") || key.contains("weightScale"))
+            {
+                return false
+            }
+            return true
+        }
+    }
 
     // NovaMLX-TIE: when manifest exists, per-shard scales are in tie-shards/
     // (not in the in-memory weights dict). The standard quantize() check
@@ -401,24 +445,52 @@ public func loadWeights(
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil || manifestExists {
         quantize(model: model) { path, module in
+            var spec: (Int, Int, QuantizationMode)?
             if weights["\(path).scales"] != nil {
                 if let perLayerQuantization {
-                    return perLayerQuantization.quantization(layer: path)?.asTuple
+                    spec = perLayerQuantization.quantization(layer: path)?.asTuple
                 } else {
-                    return quantization?.asTuple
+                    spec = quantization?.asTuple
                 }
             } else if manifestExists
                 && (module is Linear || module is Embedding || module is SwitchLinear)
             {
                 if let perLayerQuantization {
-                    return perLayerQuantization.quantization(layer: path)?.asTuple
+                    spec = perLayerQuantization.quantization(layer: path)?.asTuple
                         ?? quantization?.asTuple
                 } else {
-                    return quantization?.asTuple
+                    spec = quantization?.asTuple
                 }
-            } else {
-                return nil
             }
+            guard var spec else { return nil }
+            let lastDim: Int?
+            if let embedding = module as? Embedding {
+                lastDim = embedding.weight.dim(-1)
+            } else if let linear = module as? Linear {
+                lastDim = linear.weight.dim(-1)
+            } else if let sw = module as? SwitchLinear {
+                lastDim = sw.weight.dim(-1)
+            } else {
+                lastDim = nil
+            }
+            // Checkpoint scales/packed weight win over config: Flash-Next MTP
+            // tensors can be 4-bit/gs32 while the backbone mixer is 8-bit/gs64,
+            // and suffix matching would otherwise apply the wrong spec.
+            if let lastDim,
+               let packed = weights["\(path).weight"],
+               let scales = weights["\(path).scales"],
+               let inferred = inferAffineQuantSpec(
+                   lastDim: lastDim, packedWeight: packed, scales: scales, mode: spec.2)
+            {
+                spec = inferred
+            } else if let lastDim, lastDim % spec.0 != 0 {
+                if lastDim % 32 == 0 {
+                    spec.0 = 32
+                } else {
+                    return nil
+                }
+            }
+            return spec
         }
     }
 
@@ -428,8 +500,14 @@ public func loadWeights(
         // TIE: skip verify (per-shard weights are missing on purpose) and do
         // not materialize random quantized init into unified memory.
         model.update(parameters: parameters)
+        // Still fuse GDN / compiled-decode segments; do not eval the whole tree.
+        _ = prepareInferenceState(in: model)
     } else {
-        try model.update(parameters: parameters, verify: [.all])
+        if modelDirectory.path.contains("Flash-Next") {
+            try model.update(parameters: parameters, verify: .none)
+        } else {
+            try model.update(parameters: parameters, verify: [.all])
+        }
         materializeModelForInference(model)
     }
 }
