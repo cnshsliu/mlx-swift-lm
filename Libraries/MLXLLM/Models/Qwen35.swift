@@ -1263,7 +1263,9 @@ public class Qwen35TextModelInner: Module {
                 else { return nil }
                 mambaCaches[i] = mambaCache
             } else {
-                guard let kv = cache[i], usesPlainAttentionCacheRoute(kv) else { return nil }
+                guard let kv = cache[i], usesPlainAttentionCacheRoute(kv) else {
+                    return nil
+                }
             }
         }
 

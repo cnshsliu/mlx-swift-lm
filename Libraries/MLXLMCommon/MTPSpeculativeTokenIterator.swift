@@ -511,14 +511,21 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let verifyTokens = concatenated([bonusToken, flatDraftTokens])
         let verifyInput = LMInput.Text(tokens: verifyTokens)
         let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
-        // Native hybrid rewind: GDN layers capture the round's inputs so the
-        // rollback recomputes state at any acceptance point. The split
-        // checkpoint (index 1) only ever described depth-1 rounds.
+        // Hybrid rewind with GDN capture: the compiled segment path crashes
+        // in the MTP execution context (MLX compile bug — works in isolation,
+        // crashes when the draft chain has run first). Keep recordSpec until
+        // the compile interaction is understood. The pre-round snapshot +
+        // rejection re-run infrastructure stays for when it's fixed.
+        var preRoundGDNStates: [(conv: MLXArray, rec: MLXArray)] = []
         if nativeHybridRewind {
+            for case let mamba as MambaCache in mainCache {
+                preRoundGDNStates.append((conv: mamba[0]!, rec: mamba[1]!))
+            }
             verifyState[mtpRecordSpecCaptureKey] = true
             verifyState[mtpCacheCheckpointIndexKey] = nil
         } else {
             verifyState[mtpCacheCheckpointIndexKey] = nil
+            verifyState[mtpRecordSpecCaptureKey] = nil
         }
         let verifyCache = nativeHybridRewind ? mainCache : round!.caches
         let mainResult = mainModel(
@@ -636,15 +643,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         if nativeHybridRewind {
             if rejected == 0 {
                 mainCacheStorage.commitProcessedTokens(verifyInput.cacheSequenceLength)
-                rbCptMs = Double(DispatchTime.now().uptimeNanoseconds - rbT0.uptimeNanoseconds) / 1e6
-                // Round-scoped captures must not leak into the next round.
-                (mainModel as? any DFlashTarget)?.dflashRollback(
-                    cache: mainCache, nRejected: 0, specWidth: numDraft + 1)
-                rbDfMs = Double(DispatchTime.now().uptimeNanoseconds - rbT0.uptimeNanoseconds) / 1e6 - rbCptMs
-                FileHandle.standardError.write(Data("[MTP-rb] cpt=\(rbCptMs) df=\(rbDfMs)\n".utf8))
             } else if let dflashTarget = mainModel as? any DFlashTarget {
-                // Depth-N rewind: GDN state recomputed from the round capture
-                // at the acceptance point; attention KV trimmed by rejected.
                 dflashTarget.dflashRollback(
                     cache: mainCache, nRejected: rejected, specWidth: numDraft + 1)
                 mainCacheStorage.commitProcessedTokens(accepted + 1)
@@ -661,7 +660,6 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 &mainState, discarding: rejected,
                 lengths: mainCacheStorage.emittedLength(forLeaf:))
             let rbRecMs = Double(DispatchTime.now().uptimeNanoseconds - rbT0.uptimeNanoseconds) / 1e6
-            FileHandle.standardError.write(Data("[MTP-rb] rec=\(rbRecMs - rbDfMs - rbCptMs) total_rb=\(rbRecMs)\n".utf8))
         } else {
             // Staged layers never held rejected rows; write-through layers clamp back over them.
             let commit = mainCacheStorage.commit(round!, retaining: accepted + 1)
