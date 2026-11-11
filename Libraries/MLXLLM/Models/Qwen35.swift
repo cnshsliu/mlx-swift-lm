@@ -887,6 +887,23 @@ final class Qwen35DecoderLayer: Module {
         )
     }
 
+    /// Multi-token variant: the [S, O+S] causal mask array covers the cached
+    /// keys plus the causal prefix among the S new queries.
+    func attentionCacheStepMasked(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        cache: KVCache, mask: MLXArray
+    ) -> MLXArray {
+        let attn = selfAttn!
+        let offset = cache.ropeOffset
+        let rotatedQueries = applyRotaryPosition(attn.rope, to: queries, offset: offset)
+        let rotatedKeys = applyRotaryPosition(attn.rope, to: keys, offset: offset)
+        let (updatedKeys, updatedValues) = cache.update(
+            keys: rotatedKeys, values: values)
+        return MLXFast.scaledDotProductAttention(
+            queries: rotatedQueries, keys: updatedKeys, values: updatedValues,
+            scale: attn.scale, mask: mask)
+    }
+
     // MARK: - Layer bodies
 
     func linearLayerBody(x: MLXArray, convState: MLXArray, recState: MLXArray) -> (
@@ -950,6 +967,7 @@ public class Qwen35TextModelInner: Module {
             linearLayers: layers.map(\.isLinear))
         self.decodeSegments = segments
         self.compiledSegments = CompiledDecodeSegmentCache(count: segments.count)
+        self.verifyCompiledSegments = CompiledDecodeSegmentCache(count: segments.count)
 
         super.init()
     }
@@ -977,6 +995,16 @@ public class Qwen35TextModelInner: Module {
             let step = decodeStep(inputs, caches)
         {
             return step
+        }
+        // Multi-token decode (MTP verify): compiled segment path at S>1.
+        // No recordSpec capture inside compiled segments — the checkpoint
+        // mechanism handles rejection rollback instead. Returns UN-normed
+        // hidden (the MTP path norms separately; the normed callers do too
+        // since segmentBody's last-segment norm is skipped here).
+        if !recordSpec, inputs.dim(1) > 1, inputs.dim(1) <= 8, let caches = cache,
+            let step = verifyStep(inputs, caches)
+        {
+            return applyFinalNorm ? norm(step) : step
         }
 
         if recordSpec {
@@ -1107,6 +1135,10 @@ public class Qwen35TextModelInner: Module {
     /// one (whose SDPA runs between this segment and the next).
     private let decodeSegments: [CompiledDecodeSegment]
     private let compiledSegments: CompiledDecodeSegmentCache
+    /// Separate compiled cache for the multi-token verify shape (MLX compile
+    /// is shape-specialized; mixing S=1 and S=4 in one cache would reuse the
+    /// wrong function).
+    private let verifyCompiledSegments: CompiledDecodeSegmentCache
 
     /// Flat argument/result lists because `compile` takes `[MLXArray]`.
     /// In: `[x]` (token ids for segment 0), then `[attention, gate]` when
@@ -1211,6 +1243,104 @@ public class Qwen35TextModelInner: Module {
         }
 
         return carry
+    }
+
+    /// Compiled multi-token forward for MTP verify (S = block width, 2-8).
+    /// Mirrors decodeStep but: causal mask for the attention queries (they
+    /// attend to all cached keys plus their causal prefix among themselves),
+    /// mamba advances by S, and a shape-separate compile cache. No recordSpec
+    /// capture — the checkpoint mechanism handles rejection rollback.
+    private func verifyStep(_ inputs: MLXArray, _ cache: [KVCache?]) -> MLXArray? {
+        let S = inputs.dim(1)
+        guard cache.count == layers.count else { return nil }
+        if createSSMMask(h: inputs, cache: cache[ssmIdx] as? MambaCache) != nil { return nil }
+
+        var mambaCaches = [MambaCache?](repeating: nil, count: layers.count)
+        for (i, layer) in layers.enumerated() {
+            if layer.isLinear {
+                guard let mambaCache = cache[i] as? MambaCache, mambaCache[0] != nil,
+                    mambaCache[1] != nil
+                else { return nil }
+                mambaCaches[i] = mambaCache
+            } else {
+                guard let kv = cache[i], usesPlainAttentionCacheRoute(kv) else { return nil }
+            }
+        }
+
+        var carry = inputs
+        var pendingAttention: [MLXArray] = []
+
+        for (segmentIndex, segment) in decodeSegments.enumerated() {
+            var args: [MLXArray] = [carry] + pendingAttention
+            for layerIndex in segment.linearLayers {
+                let mambaCache = mambaCaches[layerIndex]!
+                args.append(mambaCache[0]!)
+                args.append(mambaCache[1]!)
+            }
+
+            let outputs = verifyCompiledSegments.call(
+                at: segmentIndex, arguments: args
+            ) { [unowned self] segmentArgs in
+                self.verifySegmentBody(at: segmentIndex, segmentArgs)
+            }
+
+            carry = outputs[0]
+            for (i, layerIndex) in segment.linearLayers.enumerated() {
+                let mambaCache = mambaCaches[layerIndex]!
+                mambaCache[0] = outputs[1 + 2 * i]
+                mambaCache[1] = outputs[2 + 2 * i]
+                mambaCache.advance(S)
+            }
+
+            pendingAttention = []
+            if let pre = segment.attentionPreLayer {
+                let head = segment.attentionOutputOffset
+                // Multi-token queries attend to all cached keys plus the
+                // causal prefix among the S new keys: an explicit [S, O+S]
+                // mask built from the cache offset.
+                let attnCache = cache[pre]!
+                let offset = attnCache.offset
+                let maskArray = createCausalMask(
+                    n: S, offset: offset)
+                let attention = layers[pre].attentionCacheStepMasked(
+                    queries: outputs[head], keys: outputs[head + 2],
+                    values: outputs[head + 3], cache: attnCache, mask: maskArray)
+                pendingAttention = [attention, outputs[head + 1]]
+            }
+        }
+
+        return carry
+    }
+
+    /// Segment body for the verify path: identical to segmentBody but the
+    /// final segment does NOT apply the output norm — the MTP caller norms
+    /// separately, and the general forward's applyFinalNorm handles it too.
+    private func verifySegmentBody(at index: Int, _ args: [MLXArray]) -> [MLXArray] {
+        let segment = decodeSegments[index]
+        var hiddenStates = index == 0 ? embedTokens(args[0]) : args[0]
+
+        if let post = segment.attentionPostLayer {
+            hiddenStates = layers[post].attentionPostBody(
+                x: hiddenStates, attention: args[1], gate: args[2])
+        }
+
+        var states: [MLXArray] = []
+        for (i, layerIndex) in segment.linearLayers.enumerated() {
+            let slot = segment.stateInputOffset + 2 * i
+            let (out, newConvState, newRecState) = layers[layerIndex].linearLayerBody(
+                x: hiddenStates, convState: args[slot], recState: args[slot + 1])
+            hiddenStates = out
+            states.append(newConvState)
+            states.append(newRecState)
+        }
+
+        if let pre = segment.attentionPreLayer {
+            let (queries, gate, keys, values) = layers[pre].attentionPreBody(x: hiddenStates)
+            return [hiddenStates] + states + [queries, gate, keys, values]
+        }
+
+        // No final norm — verify callers handle it.
+        return [hiddenStates] + states
     }
 }
 
