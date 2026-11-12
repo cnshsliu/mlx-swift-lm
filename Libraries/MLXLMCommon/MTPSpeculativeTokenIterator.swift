@@ -519,6 +519,20 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         var preRoundGDNStates: [(conv: MLXArray, rec: MLXArray)] = []
         var preRoundKVOffset = -1
         if nativeHybridRewind {
+            // Non-compiled path (38-40 tok/s): the compiled segments save
+            // 2ms submit but cost ~40ms more on GPU. Revert when the MLX
+            // compile kernel for S>1 closes the gap.
+            verifyState[mtpRecordSpecCaptureKey] = true
+            verifyState[mtpCacheCheckpointIndexKey] = nil
+        } else {
+            verifyState[mtpCacheCheckpointIndexKey] = nil
+            verifyState[mtpRecordSpecCaptureKey] = nil
+        }
+        // Pre-round snapshot only for the compiled path (recordSpec=false):
+        // the re-run rejection path is the fallback when dflashRollback has
+        // no captures. Keeping this conditional ensures the fast dflashRollback
+        // handles rejection when captures ARE available.
+        if nativeHybridRewind, verifyState[mtpRecordSpecCaptureKey] == nil {
             for case let mamba as MambaCache in mainCache {
                 preRoundGDNStates.append((conv: mamba[0]!, rec: mamba[1]!))
             }
@@ -528,14 +542,6 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                     break
                 }
             }
-            // Compiled verify path: recordSpec=false lets verifyStep's
-            // compiled segments run (proven equivalent: CompiledS4Tests
-            // diff=0.0). Rejection handles state correction below.
-            verifyState[mtpRecordSpecCaptureKey] = nil
-            verifyState[mtpCacheCheckpointIndexKey] = nil
-        } else {
-            verifyState[mtpCacheCheckpointIndexKey] = nil
-            verifyState[mtpRecordSpecCaptureKey] = nil
         }
         let verifyCache = nativeHybridRewind ? mainCache : round!.caches
         let mainResult = mainModel(
