@@ -638,6 +638,12 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
             var currentDrafterState = drafterState
         {
+            // All-accept: the bonus token IS the backbone's ground-truth
+            // prediction of the next token. Seed the drafter with it and
+            // save the 1.35GB lm_head read inside commitDrafterState.
+            if numDraft - accepted == 0 {
+                currentDrafterState.preComputedSeedToken = emittedFinalToken
+            }
             statefulDrafter.commitDrafterState(
                 target: mainModel,
                 targetHidden: mainResult.state?[mtpLastHiddenStatesKey] ?? lastHidden,

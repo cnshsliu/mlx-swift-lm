@@ -281,9 +281,16 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel, LLMMode
             positionOffset: state.nextPosition)
         state.nextPosition += committedTokens.dim(1)
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
-        state.seedToken = sampleMTPSeed(
-            hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
-            lmHead: lmHead, sampler: sampler)
+        // Ground-truth seed from the verify's own argmax saves the 1.35GB
+        // lm_head read (96% of rounds are all-accept).
+        if let preSeed = state.preComputedSeedToken {
+            state.seedToken = preSeed
+            state.preComputedSeedToken = nil
+        } else {
+            state.seedToken = sampleMTPSeed(
+                hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
+                lmHead: lmHead, sampler: sampler)
+        }
         state.proposalAppended = 0
     }
 

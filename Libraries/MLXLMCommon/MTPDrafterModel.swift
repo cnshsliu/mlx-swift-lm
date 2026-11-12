@@ -116,6 +116,12 @@ public struct MTPDrafterState {
     public var seedToken: MLXArray?
     public var seedHidden: MLXArray?
 
+    /// Ground-truth next-token from the verify (all-accept rounds): the
+    /// backbone's own argmax at the last verify position. When set,
+    /// commitDrafterState skips its 1.35GB lm_head call — the backbone's
+    /// prediction is strictly better than the MTP head's approximation.
+    public var preComputedSeedToken: MLXArray?
+
     /// Number of tentative cache entries appended by the current proposal.
     public var proposalAppended: Int
 
