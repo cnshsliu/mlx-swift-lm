@@ -517,11 +517,21 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // the compile interaction is understood. The pre-round snapshot +
         // rejection re-run infrastructure stays for when it's fixed.
         var preRoundGDNStates: [(conv: MLXArray, rec: MLXArray)] = []
+        var preRoundKVOffset = -1
         if nativeHybridRewind {
             for case let mamba as MambaCache in mainCache {
                 preRoundGDNStates.append((conv: mamba[0]!, rec: mamba[1]!))
             }
-            verifyState[mtpRecordSpecCaptureKey] = true
+            for case let kv in mainCache {
+                if let simple = kv as? KVCacheSimple {
+                    preRoundKVOffset = simple.offset
+                    break
+                }
+            }
+            // Compiled verify path: recordSpec=false lets verifyStep's
+            // compiled segments run (proven equivalent: CompiledS4Tests
+            // diff=0.0). Rejection handles state correction below.
+            verifyState[mtpRecordSpecCaptureKey] = nil
             verifyState[mtpCacheCheckpointIndexKey] = nil
         } else {
             verifyState[mtpCacheCheckpointIndexKey] = nil
@@ -636,13 +646,48 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         let postCommitMs = Double(DispatchTime.now().uptimeNanoseconds - postCommitT0.uptimeNanoseconds) / 1e6
         let rejected = numDraft - accepted
-        let snapshotPlaced: Bool
+        var snapshotPlaced: Bool = false
+        var skipReconcile = false
         let rbT0 = DispatchTime.now()
         var rbCptMs = 0.0
         var rbDfMs = 0.0
         if nativeHybridRewind {
             if rejected == 0 {
                 mainCacheStorage.commitProcessedTokens(verifyInput.cacheSequenceLength)
+            } else if !preRoundGDNStates.isEmpty, preRoundKVOffset >= 0 {
+                // Compiled-verify rejection: restore pre-round GDN states,
+                // manually trim each KVCacheSimple (trimPromptCache is
+                // blocked by MambaCache.isTrimmable=false), re-run the
+                // accepted prefix through the general path.
+                var gi = 0
+                for case let mamba as MambaCache in mainCache {
+                    mamba[0] = preRoundGDNStates[gi].conv
+                    mamba[1] = preRoundGDNStates[gi].rec
+                    mamba.offset = preRoundKVOffset
+                    gi += 1
+                }
+                for case let kv in mainCache {
+                    _ = kv.trim(numDraft + 1)
+                }
+                let postTrimOffset = mainCache.compactMap { ($0 as? KVCacheSimple)?.offset }.first ?? -1
+                let rerunTokens = concatenated([
+                    bonusToken,
+                    flatDraftTokens[..<accepted],
+                ])
+                var rerunState = state
+                rerunState[mtpEmitFlagKey] = true
+                rerunState[mtpRecordSpecCaptureKey] = true  // general path
+                let rerunResult = mainModel(
+                    LMInput.Text(tokens: rerunTokens)[text: .newAxis],
+                    cache: mainCache, state: rerunState)
+                mainState = rerunResult.state
+                // The re-run emits state at the accepted+1 position but the
+                // MTP drafter never reads sharedKV (requiresSharedTargetKV=false).
+                // Clear it to avoid the next round's timeline assertion; the
+                // next verify re-emits it fresh.
+                mainState?[mtpSharedKVStatesKey] = nil
+                mainState?[mtpSharedKVOffsetsKey] = nil
+                mainCacheStorage.commitProcessedTokens(accepted + 1)
             } else if let dflashTarget = mainModel as? any DFlashTarget {
                 dflashTarget.dflashRollback(
                     cache: mainCache, nRejected: rejected, specWidth: numDraft + 1)
@@ -656,9 +701,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 )
                 mainCacheStorage.commitProcessedTokens(accepted + 1)
             }
-            snapshotPlaced = reconcileSharedKVState(
-                &mainState, discarding: rejected,
-                lengths: mainCacheStorage.emittedLength(forLeaf:))
+            if !skipReconcile {
+                snapshotPlaced = reconcileSharedKVState(
+                    &mainState, discarding: rejected,
+                    lengths: mainCacheStorage.emittedLength(forLeaf:))
+            }
             let rbRecMs = Double(DispatchTime.now().uptimeNanoseconds - rbT0.uptimeNanoseconds) / 1e6
         } else {
             // Staged layers never held rejected rows; write-through layers clamp back over them.
