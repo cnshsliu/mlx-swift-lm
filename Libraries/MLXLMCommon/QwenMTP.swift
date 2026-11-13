@@ -95,7 +95,8 @@ package func draftMTPTokenBlock(
     // only for those K rows (quantizedMatmul on a gathered sub-matrix).
     // 3 draft steps drop from 3×1.35GB to 3×~45MB of weight reads.
     let restrictedLmHead: ((MLXArray) -> MLXArray)?
-    if let candidates = candidateIds, let quantLmHead = lmHead as? QuantizedLinear {
+    if let candidateIds, let quantLmHead = lmHead as? QuantizedLinear {
+        let candidates = candidateIds.ndim > 1 ? candidateIds.flattened() : candidateIds
         let wK = quantLmHead.weight[candidates]
         let sK = quantLmHead.scales[candidates]
         let bK = quantLmHead.biases?[candidates]
