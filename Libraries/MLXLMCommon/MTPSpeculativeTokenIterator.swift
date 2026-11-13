@@ -635,6 +635,17 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         )
 
         let postCommitT0 = DispatchTime.now()
+        // Top-K candidates from the verify's last-position logits: the next
+        // round's draft restricts its lm_head to these K rows, dropping 3
+        // × 1.35GB reads to 3 × ~45MB. The last verify position predicts
+        // what comes after the last processed token — regardless of
+        // acceptance, this is a reasonable candidate set.
+        if var currentDrafterState = drafterState {
+            let lastLogits = mainLogits[0..., -1, 0...]  // [1, 248320]
+            let sortedIds = MLX.argSort(-lastLogits, axis: -1)  // descending
+            currentDrafterState.candidateIds = sortedIds[0..., ..<8192]
+            drafterState = currentDrafterState
+        }
         if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
             var currentDrafterState = drafterState
         {

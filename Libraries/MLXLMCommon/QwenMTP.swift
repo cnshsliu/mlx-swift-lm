@@ -83,12 +83,32 @@ package func draftMTPTokenBlock(
     blockSize: Int,
     sampler: any LogitSampler,
     cache: [KVCache],
+    candidateIds: MLXArray? = nil,
     forward: (
         _ inputsEmbeds: MLXArray, _ hiddenStates: MLXArray, _ cache: [KVCache],
         _ positionOffset: Int
     ) -> MLXArray
 ) -> MLXArray {
     precondition(blockSize >= 2, "blockSize must be >= 2")
+
+    // Restricted lm_head: when candidate IDs are available, compute logits
+    // only for those K rows (quantizedMatmul on a gathered sub-matrix).
+    // 3 draft steps drop from 3×1.35GB to 3×~45MB of weight reads.
+    let restrictedLmHead: ((MLXArray) -> MLXArray)?
+    if let candidates = candidateIds, let quantLmHead = lmHead as? QuantizedLinear {
+        let wK = quantLmHead.weight[candidates]
+        let sK = quantLmHead.scales[candidates]
+        let bK = quantLmHead.biases?[candidates]
+        restrictedLmHead = { hidden in
+            quantizedMatmul(
+                hidden, wK, scales: sK, biases: bK,
+                transpose: true,
+                groupSize: quantLmHead.groupSize,
+                bits: quantLmHead.bits)
+        }
+    } else {
+        restrictedLmHead = nil
+    }
 
     var tok = lastToken.ndim == 1 ? lastToken.reshaped([lastToken.dim(0), 1]) : lastToken
     var hidden = lastHidden
@@ -106,7 +126,9 @@ package func draftMTPTokenBlock(
         hidden = mtpHidden
 
         let logits: MLXArray
-        if let lmHead {
+        if let restricted = restrictedLmHead {
+            logits = restricted(mtpHidden)
+        } else if let lmHead {
             logits = lmHead(mtpHidden)
         } else {
             logits = targetEmbedTokens.asLinear(mtpHidden)

@@ -122,6 +122,12 @@ public struct MTPDrafterState {
     /// prediction is strictly better than the MTP head's approximation.
     public var preComputedSeedToken: MLXArray?
 
+    /// Top-K candidate token IDs from the verify's logits. When set, the
+    /// draft chain restricts its lm_head to these K rows (quantizedMatmul
+    /// on gathered sub-matrix) instead of the full 248K vocabulary.
+    /// 3 draft lm_head calls drop from 3×1.35GB to 3×~45MB reads.
+    public var candidateIds: MLXArray?
+
     /// Number of tentative cache entries appended by the current proposal.
     public var proposalAppended: Int
 

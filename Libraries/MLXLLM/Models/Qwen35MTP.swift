@@ -208,7 +208,8 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel, LLMMode
                 queryOffset: queryOffset,
                 blockSize: chainBlock,
                 sampler: sampler,
-                cache: state.cache
+                cache: state.cache,
+                candidateIds: state.candidateIds
             ) { inputsEmbeds, hiddenStates, cache, positionOffset in
                 mtp(
                     inputsEmbeds: inputsEmbeds,
@@ -232,7 +233,8 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel, LLMMode
             queryOffset: queryOffset,
             blockSize: blockSize,
             sampler: sampler,
-            cache: state.cache
+            cache: state.cache,
+            candidateIds: state.candidateIds
         ) { inputsEmbeds, hiddenStates, cache, positionOffset in
             mtp(
                 inputsEmbeds: inputsEmbeds,
